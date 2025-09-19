@@ -306,3 +306,29 @@ cron.schedule('*/5 * * * *', async () => {
 app.listen(PORT, () => {
   console.log(`✅ Server avviato su http://localhost:${PORT}`);
 });
+// === UPLOAD IMMAGINI (Render: storage effimero in /tmp) ===
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
+
+const UPLOAD_DIR = '/tmp/uploads';
+try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch {}
+
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
+  filename: (_req, file, cb) => {
+    const safe = Date.now() + '-' + file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
+    cb(null, safe);
+  },
+});
+const upload = multer({ storage });
+
+// Servi i file caricati
+app.use('/uploads', express.static(UPLOAD_DIR));
+
+// Endpoint di upload (campo "file")
+app.post('/api/upload', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Nessun file' });
+  const url = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+  res.json({ url });
+});
