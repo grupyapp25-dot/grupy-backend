@@ -8,6 +8,14 @@ const cron = require('node-cron');
 const { readDB, writeDB } = require('./db');
 const dbpg = require('./db_pg'); // <— nuovo
 
+// --- DEBUG ENV (rimuovi dopo la diagnosi) ---
+const rawConn = process.env.DATABASE_URL || '';
+const maskedConn = rawConn
+  ? rawConn.replace(/:[^@]+@/, ':****@').slice(0, 120) + (rawConn.length > 120 ? '…' : '')
+  : '(undefined)';
+console.log('🔧 DATABASE_URL at startup =', maskedConn);
+
+
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || 'changeme';
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
@@ -49,6 +57,11 @@ function computeStatus(profile) {
 // ---------- base ----------
 app.get('/', (req, res) => res.json({ ok: true, service: 'Grupy API' }));
 app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/env-check', (req, res) => {
+  const raw = process.env.DATABASE_URL || '';
+  const masked = raw ? raw.replace(/:[^@]+@/, ':****@') : '(undefined)';
+  res.json({ has_DATABASE_URL: !!raw, DATABASE_URL_preview: masked });
+});
 
 // ---------- AUTH ----------
 app.post('/api/users/register', async (req, res) => {
@@ -313,6 +326,16 @@ app.get('/health/db', async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+// --- subito sotto gli altri endpoint /health
+app.get('/health/db-info', async (req, res) => {
+  try {
+    const r = await dbpg.query('select now() as now, version() as pg');
+    res.json({ ok: true, now: r.rows[0].now, version: r.rows[0].pg });
+  } catch (e) {
+    console.error('DB info error:', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 // ---------- start ----------
 app.listen(PORT, () => {
@@ -344,3 +367,4 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
   const url = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
   res.json({ url });
 });
+
