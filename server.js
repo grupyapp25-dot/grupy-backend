@@ -33,15 +33,7 @@ function auth(req, res, next) {
   }
 }
 
-app.get('/health/db', async (req, res) => {
-  try {
-    const ok = await dbpg.ping();
-    res.json({ ok: true, db: ok ? 'connected' : 'unknown' });
-  } catch (e) {
-    console.error('DB health error:', e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
+
 
 function computeStatus(profile) {
   const attended = profile.eventsAttended || 0;
@@ -311,6 +303,15 @@ cron.schedule('*/5 * * * *', async () => {
 
   await writeDB(db);
   console.log('🕒 job: controllo eventi e notifiche voto OK');
+});
+app.get('/health/db', async (req, res) => {
+  try {
+    const ok = await dbpg.ping();
+    res.json({ ok: true, db: ok ? 'connected' : 'unknown' });
+  } catch (e) {
+    console.error('DB health error:', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // ---------- start ----------
