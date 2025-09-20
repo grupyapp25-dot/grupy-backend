@@ -319,8 +319,8 @@ app.listen(PORT, () => {
 });
 // === UPLOAD IMMAGINI (Render: storage effimero in /tmp) ===
 const multer = require('multer');
-import path from 'path';
-import fs from 'fs';
+const path = require('path');
+const fs = require('fs');
 
 const UPLOAD_DIR = '/tmp/uploads';
 try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch {}
