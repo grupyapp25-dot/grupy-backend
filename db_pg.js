@@ -1,57 +1,92 @@
-// db_pg.js — client Postgres per Supabase (Render richiede SSL)
+// db_pg.js — client Postgres per Supabase (forza IPv4 su Render)
 const { Pool } = require('pg');
+const dns = require('dns');
 
-let raw = process.env.DATABASE_URL || '';
-
-if (!raw) {
-  console.error('❌ DATABASE_URL non impostata nelle env vars');
-}
-
-// Log mascherato (solo diagnostica)
-const masked = raw ? raw.replace(/:[^@]+@/, ':****@') : '(undefined)';
+// Leggiamo la DATABASE_URL e facciamo un piccolo mask solo per i log
+const raw = process.env.DATABASE_URL || '';
+const masked = raw
+  ? raw.replace(/(postgres(?:ql)?:\/\/[^:]+:)[^@]+(@)/, '$1****$2')
+  : '(undefined)';
 console.log('🧪 db_pg.js sees DATABASE_URL =', masked);
 
-// 1) Normalizza schema: "postgresql://" -> "postgres://"
-if (raw && raw.startsWith('postgresql://')) {
-  raw = 'postgres://' + raw.slice('postgresql://'.length);
+// Parser robusto per DATABASE_URL
+function parseDbUrl(dbUrl) {
+  try {
+    const u = new URL(dbUrl); // es: postgresql://user:pass@host:5432/db?sslmode=require
+
+    // NOTA: la spec corretta del protocollo è "postgresql:" o "postgres:"
+    if (!/^postgres(ql)?:$/.test(u.protocol)) {
+      throw new Error('Protocollo non postgres/postgresql');
+    }
+
+    return {
+      host: u.hostname,
+      port: u.port ? Number(u.port) : 5432,
+      database: u.pathname ? u.pathname.replace(/^\//, '') : 'postgres',
+      user: decodeURIComponent(u.username || ''),
+      password: decodeURIComponent(u.password || ''),
+      ssl: (u.searchParams.get('sslmode') || '').toLowerCase() === 'require',
+    };
+  } catch (e) {
+    console.error('❌ DATABASE_URL non è un URL valido:', e.message);
+    return null;
+  }
 }
 
-let cfg;
-try {
-  // 2) Parsiamo noi l’URL in modo robusto
-  const u = new URL(raw);
-
-  // Nota: pathname è tipo "/postgres" -> togliamo lo slash iniziale
-  const database = u.pathname ? u.pathname.replace(/^\//, '') : undefined;
-
-  cfg = {
-    host: u.hostname,
-    port: u.port ? Number(u.port) : 5432,
-    database,
-    user: decodeURIComponent(u.username || ''),
-    password: decodeURIComponent(u.password || ''),
-    // 3) SSL per Render+Supabase
-    ssl: { rejectUnauthorized: false },
-  };
-} catch (e) {
-  console.error('❌ DATABASE_URL non è un URL valido:', e.message || e);
-  // Metto una cfg che fallirà subito ma con errore chiaro
-  cfg = { host: 'invalid', database: 'invalid', user: 'invalid', password: 'invalid' };
-}
-
-// (log mini utile per debugging — senza password)
+const parsed = parseDbUrl(raw);
 console.log('🧪 PG config:', {
-  host: cfg.host,
-  port: cfg.port,
-  database: cfg.database,
-  user: cfg.user ? '(present)' : '(empty)',
-  ssl: cfg.ssl ? 'on' : 'off',
+  host: parsed?.host || 'invalid',
+  port: parsed?.port,
+  database: parsed?.database || 'invalid',
+  user: parsed?.user ? '(present)' : '(missing)',
+  ssl: parsed?.ssl ? 'on' : 'off',
 });
 
-const pool = new Pool(cfg);
+let pool;
+
+// Costruiamo il Pool **forzando IPv4**
+async function buildPool() {
+  if (!parsed) throw new Error('DATABASE_URL non valida');
+
+  let ipv4Host = parsed.host;
+
+  try {
+    // Risolviamo a IPv4 (A record)
+    const addrs = await new Promise((resolve, reject) =>
+      dns.resolve4(parsed.host, (err, addresses) => (err ? reject(err) : resolve(addresses)))
+    );
+    if (Array.isArray(addrs) && addrs.length > 0) {
+      ipv4Host = addrs[0];
+      console.log(`🌐 DNS resolve4(${parsed.host}) -> ${ipv4Host}`);
+    } else {
+      console.warn(`⚠️  Nessun A-record IPv4 per ${parsed.host}, uso hostname come fallback`);
+    }
+  } catch (e) {
+    console.warn(`⚠️  resolve4 fallita per ${parsed.host}: ${e.message}. Uso hostname come fallback`);
+  }
+
+  pool = new Pool({
+    host: ipv4Host,                 // IPv4 forzato
+    port: parsed.port,
+    database: parsed.database,
+    user: parsed.user,
+    password: parsed.password,
+    ssl: parsed.ssl ? { rejectUnauthorized: false } : false,
+    // timeouts più “sicuri”
+    idleTimeoutMillis: 10_000,
+    connectionTimeoutMillis: 10_000,
+    max: 5,
+  });
+
+  // test connessione immediato per fallire presto se c'è un problema
+  const client = await pool.connect();
+  client.release();
+  console.log('✅ Pool Postgres pronto');
+}
 
 // Helper generico per query
 async function query(text, params) {
+  if (!pool) await buildPool();
   const client = await pool.connect();
   try {
     const res = await client.query(text, params);
@@ -67,12 +102,10 @@ async function ping() {
     const res = await query('select 1 as ok');
     return res.rows?.[0]?.ok === 1;
   } catch (e) {
-    console.error('❌ DB ping error:', e && e.message ? e.message : e);
-    if (e && e.code) console.error('PG code:', e.code);
-    if (e && e.detail) console.error('PG detail:', e.detail);
-    if (e && e.hint) console.error('PG hint:', e.hint);
+    console.error('❌ DB ping error:', e);
+    if (e.code) console.error('PG code:', e.code);
     throw e;
   }
 }
 
-module.exports = { pool, query, ping };
+module.exports = { pool: () => pool, query, ping };
