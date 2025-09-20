@@ -6,9 +6,9 @@ const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
 const cron = require('node-cron');
 const { readDB, writeDB } = require('./db');
-const dbpg = require('./db_pg'); // Postgres
+const dbpg = require('./db_pg'); // client Postgres opzionale (health/info)
 
-// --- DEBUG ENV (puoi rimuovere dopo) ---
+// --- DEBUG ENV (puoi rimuovere quando vuoi) ---
 const rawConn = process.env.DATABASE_URL || '';
 const maskedConn = rawConn
   ? rawConn.replace(/:[^@]+@/, ':****@').slice(0, 120) + (rawConn.length > 120 ? '…' : '')
@@ -27,6 +27,7 @@ app.use(express.json({ limit: '5mb' }));
 function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
 }
+
 function auth(req, res, next) {
   const h = req.headers.authorization || '';
   const token = h.startsWith('Bearer ') ? h.slice(7) : null;
@@ -38,6 +39,7 @@ function auth(req, res, next) {
     return res.status(401).json({ error: 'Invalid token' });
   }
 }
+
 function computeStatus(profile) {
   const attended = profile.eventsAttended || 0;
   const up = profile.feedback?.up || 0;
@@ -57,6 +59,8 @@ app.get('/env-check', (req, res) => {
   const masked = raw ? raw.replace(/:[^@]+@/, ':****@') : '(undefined)';
   res.json({ has_DATABASE_URL: !!raw, DATABASE_URL_preview: masked });
 });
+
+// ---------- HEALTH DB (Postgres) ----------
 app.get('/health/db', async (req, res) => {
   try {
     const ok = await dbpg.ping();
@@ -66,6 +70,8 @@ app.get('/health/db', async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+// Info DB Postgres
 app.get('/health/db-info', async (req, res) => {
   try {
     const r = await dbpg.query('select now() as now, version() as pg');
@@ -76,225 +82,288 @@ app.get('/health/db-info', async (req, res) => {
   }
 });
 
-// ---------- AUTH (Postgres) ----------
-app.post('/api/users/register', async (req, res) => {
-  const { username, password } = req.body || {};
-  if (!username || !password) return res.status(400).json({ error: 'username e password richiesti' });
-
-  const uname = String(username).trim();
-  if (!/^[a-zA-Z0-9._-]{3,32}$/.test(uname)) {
-    return res.status(400).json({ error: 'Username non valido' });
-  }
-
+// ---------- HEALTH DB FILE (JSON su FS) ----------
+app.get('/health/db-file', async (_req, res) => {
   try {
-    // esiste già?
-    const existing = await dbpg.query(
-      'select id from app_users where lower(username)=lower($1) limit 1',
-      [uname]
-    );
-    if (existing.rowCount > 0) return res.status(409).json({ error: 'Username già in uso' });
-
-    const passwordHash = await bcrypt.hash(password, 10);
-
-    const inserted = await dbpg.query(
-      `insert into app_users (username, password_hash, city, eta, citta, descrizione, profile_photo)
-       values ($1, $2, '', '', '', '', null)
-       returning id, username, profile_photo as "profilePhoto", city`,
-      [uname, passwordHash]
-    );
-
-    const user = inserted.rows[0];
-    const token = signToken({ id: user.id, username: user.username });
-    return res.json({ token, user });
+    const db = await readDB();
+    res.json({
+      ok: true,
+      usersCount: db.users.length,
+      groupsCount: db.groups.length,
+      profilesCount: Object.keys(db.profiles).length,
+      postsCount: db.posts.length
+    });
   } catch (e) {
-    console.error('register error:', e);
-    return res.status(500).json({ error: 'Errore server' });
+    console.error('DB FILE health error:', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ---------- AUTH ----------
+app.post('/api/users/register', async (req, res) => {
+  try {
+    const { username, password } = req.body || {};
+    if (!username || !password) return res.status(400).json({ error: 'username e password richiesti' });
+
+    const db = await readDB();
+    if (db.users.find(u => u.username.toLowerCase() === String(username).toLowerCase())) {
+      return res.status(409).json({ error: 'Username già in uso' });
+    }
+
+    const hash = await bcrypt.hash(password, 10);
+    const user = {
+      id: uuidv4(),
+      username,
+      passwordHash: hash,
+      eta: '',
+      citta: '',
+      descrizione: '',
+      profilePhoto: null,
+      city: ''
+    };
+    db.users.push(user);
+
+    if (!db.profiles[username]) {
+      db.profiles[username] = {
+        feedback: { up: 0, down: 0 },
+        eventsAttended: 0,
+        status: 'Nuovo utente'
+      };
+    }
+
+    await writeDB(db);
+
+    const token = signToken({ id: user.id, username: user.username });
+    res.json({ token, user: { id: user.id, username: user.username, profilePhoto: user.profilePhoto, city: user.city } });
+  } catch (e) {
+    console.error('REGISTER error:', e);
+    res.status(500).json({ error: e.message || 'Errore server' });
   }
 });
 
 app.post('/api/users/login', async (req, res) => {
-  const { username, password } = req.body || {};
-  if (!username || !password) return res.status(400).json({ error: 'username e password richiesti' });
-
   try {
-    const r = await dbpg.query(
-      `select id, username, password_hash, profile_photo as "profilePhoto", city, eta, citta, descrizione
-       from app_users
-       where lower(username)=lower($1)
-       limit 1`,
-      [username]
-    );
-    if (r.rowCount === 0) return res.status(401).json({ error: 'Credenziali non valide' });
+    const { username, password } = req.body || {};
+    if (!username || !password) return res.status(400).json({ error: 'username e password richiesti' });
 
-    const row = r.rows[0];
-    const ok = await bcrypt.compare(password, row.password_hash || '');
+    const db = await readDB();
+    const user = db.users.find(u => u.username.toLowerCase() === String(username).toLowerCase());
+    if (!user) return res.status(401).json({ error: 'Credenziali non valide' });
+
+    const ok = await bcrypt.compare(password, user.passwordHash || '');
     if (!ok) return res.status(401).json({ error: 'Credenziali non valide' });
 
-    const token = signToken({ id: row.id, username: row.username });
-    delete row.password_hash;
-    return res.json({ token, user: row });
+    const token = signToken({ id: user.id, username: user.username });
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        profilePhoto: user.profilePhoto,
+        city: user.city,
+        eta: user.eta || '',
+        citta: user.citta || '',
+        descrizione: user.descrizione || ''
+      }
+    });
   } catch (e) {
-    console.error('login error:', e);
-    return res.status(500).json({ error: 'Errore server' });
+    console.error('LOGIN error:', e);
+    res.status(500).json({ error: e.message || 'Errore server' });
   }
 });
 
 app.get('/api/users/me', auth, async (req, res) => {
   try {
-    const r = await dbpg.query(
-      `select id, username, profile_photo as "profilePhoto", city, eta, citta, descrizione
-       from app_users
-       where id=$1`,
-      [req.user.id]
-    );
-    if (r.rowCount === 0) return res.status(404).json({ error: 'Not found' });
-
-    // manteniamo lo shape attuale per compatibilità FE
-    const user = r.rows[0];
-    const profile = { feedback: { up: 0, down: 0 }, eventsAttended: 0, status: 'Nuovo utente' };
-    return res.json({ user, profile });
+    const db = await readDB();
+    const user = db.users.find(u => u.id === req.user.id);
+    if (!user) return res.status(404).json({ error: 'Not found' });
+    const profile = db.profiles[user.username] || { feedback: { up: 0, down: 0 }, eventsAttended: 0, status: 'Nuovo utente' };
+    res.json({ user, profile });
   } catch (e) {
-    console.error('me error:', e);
-    return res.status(500).json({ error: 'Errore server' });
+    console.error('ME error:', e);
+    res.status(500).json({ error: e.message || 'Errore server' });
   }
 });
 
+// aggiorna dati profilo base (eta, citta, descrizione, profilePhoto url)
 app.put('/api/users/me', auth, async (req, res) => {
-  const { eta, citta, descrizione, profilePhoto, city } = req.body || {};
   try {
-    const r = await dbpg.query(
-      `update app_users
-         set eta = coalesce($2, eta),
-             citta = coalesce($3, citta),
-             descrizione = coalesce($4, descrizione),
-             profile_photo = coalesce($5, profile_photo),
-             city = coalesce($6, city)
-       where id = $1
-       returning id, username, profile_photo as "profilePhoto", city, eta, citta, descrizione`,
-      [req.user.id, eta ?? null, citta ?? null, descrizione ?? null, profilePhoto ?? null, city ?? null]
-    );
-    if (r.rowCount === 0) return res.status(404).json({ error: 'Not found' });
-    return res.json({ ok: true, user: r.rows[0] });
+    const { eta, citta, descrizione, profilePhoto, city } = req.body || {};
+    const db = await readDB();
+    const user = db.users.find(u => u.id === req.user.id);
+    if (!user) return res.status(404).json({ error: 'Not found' });
+    if (eta !== undefined) user.eta = eta;
+    if (citta !== undefined) user.citta = citta;
+    if (descrizione !== undefined) user.descrizione = descrizione;
+    if (profilePhoto !== undefined) user.profilePhoto = profilePhoto;
+    if (city !== undefined) user.city = city;
+    await writeDB(db);
+    res.json({ ok: true, user });
   } catch (e) {
-    console.error('update me error:', e);
-    return res.status(500).json({ error: 'Errore server' });
+    console.error('UPDATE ME error:', e);
+    res.status(500).json({ error: e.message || 'Errore server' });
   }
 });
 
-// ---------- GROUPS (ancora su file, li migriamo dopo) ----------
+// ---------- GROUPS ----------
 app.get('/api/groups', auth, async (req, res) => {
-  const db = await readDB();
-  res.json(db.groups);
+  try {
+    const db = await readDB();
+    res.json(db.groups);
+  } catch (e) {
+    console.error('GET GROUPS error:', e);
+    res.status(500).json({ error: e.message || 'Errore server' });
+  }
 });
+
 app.post('/api/groups', auth, async (req, res) => {
-  const { name, category, date, time, city, address, description, budget, maxParticipants, coverPhoto, location } = req.body || {};
-  if (!name || !category || !date || !time || !city || !address || !description || budget === undefined || !maxParticipants || !location) {
-    return res.status(400).json({ error: 'Campi obbligatori mancanti' });
-  }
-  const db = await readDB();
-  const group = {
-    id: uuidv4(),
-    name, category, date, time, city, address, description,
-    budget: Number(budget),
-    maxParticipants: Number(maxParticipants),
-    coverPhoto: coverPhoto || null,
-    location,
-    creator: req.user.username,
-    participants: [req.user.username],
-    createdAt: new Date().toISOString(),
-    attendanceProcessed: false,
-    voteRequestsSent: {},
-    hasExpired: false
-  };
-  db.groups.push(group);
-  await writeDB(db);
-  res.json(group);
-});
-app.post('/api/groups/:id/join', auth, async (req, res) => {
-  const db = await readDB();
-  const g = db.groups.find(x => x.id === req.params.id);
-  if (!g) return res.status(404).json({ error: 'Gruppo non trovato' });
-  if (g.participants.includes(req.user.username)) return res.json(g);
-  if (g.participants.length >= g.maxParticipants) return res.status(400).json({ error: 'Gruppo completo' });
-  g.participants.push(req.user.username);
-  await writeDB(db);
-  res.json(g);
-});
-app.post('/api/groups/:id/leave', auth, async (req, res) => {
-  const db = await readDB();
-  const g = db.groups.find(x => x.id === req.params.id);
-  if (!g) return res.status(404).json({ error: 'Gruppo non trovato' });
-  g.participants = g.participants.filter(u => u !== req.user.username);
-  await writeDB(db);
-  res.json(g);
-});
-
-// ---------- NOTIFICATIONS (ancora su file) ----------
-app.get('/api/notifications', auth, async (req, res) => {
-  const db = await readDB();
-  const mine = db.notifications
-    .filter(n => n.user === req.user.username)
-    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-  res.json(mine);
-});
-app.post('/api/notifications/mark-read', auth, async (req, res) => {
-  const { id, all } = req.body || {};
-  const db = await readDB();
-  if (all) {
-    db.notifications.forEach(n => {
-      if (n.user === req.user.username) n.read = true;
-    });
-  } else if (id) {
-    const n = db.notifications.find(n => n.id === id && n.user === req.user.username);
-    if (n) n.read = true;
-  }
-  await writeDB(db);
-  res.json({ ok: true });
-});
-
-// ---------- VOTI post-evento (ancora su file) ----------
-app.post('/api/groups/:id/votes', auth, async (req, res) => {
-  const { votes = {}, imageUrl } = req.body || {};
-  const db = await readDB();
-  const g = db.groups.find(x => x.id === req.params.id);
-  if (!g) return res.status(404).json({ error: 'Gruppo non trovato' });
-
-  Object.entries(votes).forEach(([name, val]) => {
-    if (!db.profiles[name]) {
-      db.profiles[name] = { feedback: { up: 0, down: 0 }, eventsAttended: 0, status: 'Nuovo utente' };
+  try {
+    const { name, category, date, time, city, address, description, budget, maxParticipants, coverPhoto, location } = req.body || {};
+    if (!name || !category || !date || !time || !city || !address || !description || budget === undefined || !maxParticipants || !location) {
+      return res.status(400).json({ error: 'Campi obbligatori mancanti' });
     }
-    if (val === 1) db.profiles[name].feedback.up += 1;
-    if (val === -1) db.profiles[name].feedback.down += 1;
-    db.profiles[name].status = computeStatus(db.profiles[name]);
-  });
-
-  if (imageUrl) {
-    db.posts.push({
+    const db = await readDB();
+    const group = {
       id: uuidv4(),
-      type: 'photo',
-      text: `Foto evento: ${g.name}`,
-      image: imageUrl,
-      likes: 0,
-      likedBy: [],
-      comments: [],
-      username: req.user.username,
-      createdAt: new Date().toISOString()
-    });
+      name, category, date, time, city, address, description,
+      budget: Number(budget),
+      maxParticipants: Number(maxParticipants),
+      coverPhoto: coverPhoto || null,
+      location,
+      creator: req.user.username,
+      participants: [req.user.username],
+      createdAt: new Date().toISOString(),
+      attendanceProcessed: false,
+      voteRequestsSent: {}, // { [username]: true }
+      hasExpired: false
+    };
+    db.groups.push(group);
+    await writeDB(db);
+    res.json(group);
+  } catch (e) {
+    console.error('CREATE GROUP error:', e);
+    res.status(500).json({ error: e.message || 'Errore server' });
   }
+});
 
-  await writeDB(db);
-  res.json({ ok: true });
+app.post('/api/groups/:id/join', auth, async (req, res) => {
+  try {
+    const db = await readDB();
+    const g = db.groups.find(x => x.id === req.params.id);
+    if (!g) return res.status(404).json({ error: 'Gruppo non trovato' });
+    if (g.participants.includes(req.user.username)) return res.json(g);
+    if (g.participants.length >= g.maxParticipants) return res.status(400).json({ error: 'Gruppo completo' });
+    g.participants.push(req.user.username);
+    await writeDB(db);
+    res.json(g);
+  } catch (e) {
+    console.error('JOIN GROUP error:', e);
+    res.status(500).json({ error: e.message || 'Errore server' });
+  }
+});
+
+app.post('/api/groups/:id/leave', auth, async (req, res) => {
+  try {
+    const db = await readDB();
+    const g = db.groups.find(x => x.id === req.params.id);
+    if (!g) return res.status(404).json({ error: 'Gruppo non trovato' });
+    g.participants = g.participants.filter(u => u !== req.user.username);
+    await writeDB(db);
+    res.json(g);
+  } catch (e) {
+    console.error('LEAVE GROUP error:', e);
+    res.status(500).json({ error: e.message || 'Errore server' });
+  }
+});
+
+// ---------- NOTIFICATIONS ----------
+app.get('/api/notifications', auth, async (req, res) => {
+  try {
+    const db = await readDB();
+    const mine = db.notifications
+      .filter(n => n.user === req.user.username)
+      .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    res.json(mine);
+  } catch (e) {
+    console.error('GET NOTIFICATIONS error:', e);
+    res.status(500).json({ error: e.message || 'Errore server' });
+  }
+});
+
+app.post('/api/notifications/mark-read', auth, async (req, res) => {
+  try {
+    const { id, all } = req.body || {};
+    const db = await readDB();
+    if (all) {
+      db.notifications.forEach(n => {
+        if (n.user === req.user.username) n.read = true;
+      });
+    } else if (id) {
+      const n = db.notifications.find(n => n.id === id && n.user === req.user.username);
+      if (n) n.read = true;
+    }
+    await writeDB(db);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('MARK READ error:', e);
+    res.status(500).json({ error: e.message || 'Errore server' });
+  }
+});
+
+// ---------- VOTI post-evento ----------
+app.post('/api/groups/:id/votes', auth, async (req, res) => {
+  try {
+    // body: { votes: { [username]: -1|0|1 }, imageUrl?: string }
+    const { votes = {}, imageUrl } = req.body || {};
+    const db = await readDB();
+    const g = db.groups.find(x => x.id === req.params.id);
+    if (!g) return res.status(404).json({ error: 'Gruppo non trovato' });
+
+    // aggiorna feedback per ciascun utente votato
+    Object.entries(votes).forEach(([name, val]) => {
+      if (!db.profiles[name]) {
+        db.profiles[name] = { feedback: { up: 0, down: 0 }, eventsAttended: 0, status: 'Nuovo utente' };
+      }
+      if (val === 1) db.profiles[name].feedback.up += 1;
+      if (val === -1) db.profiles[name].feedback.down += 1;
+      db.profiles[name].status = computeStatus(db.profiles[name]);
+    });
+
+    // se c'è una foto, crea un post (semplice)
+    if (imageUrl) {
+      db.posts.push({
+        id: uuidv4(),
+        type: 'photo',
+        text: `Foto evento: ${g.name}`,
+        image: imageUrl,
+        likes: 0,
+        likedBy: [],
+        comments: [],
+        username: req.user.username,
+        createdAt: new Date().toISOString()
+      });
+    }
+
+    await writeDB(db);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('VOTES error:', e);
+    res.status(500).json({ error: e.message || 'Errore server' });
+  }
 });
 
 // ---------- JOB: scadenza eventi + invio richieste voto ----------
+// Ogni 5 minuti controlla i gruppi scaduti -> dopo 24h invia notifica "vote_request" a chi non l'ha ancora ricevuta.
 cron.schedule('*/5 * * * *', async () => {
   const db = await readDB();
   const now = new Date();
 
   for (const g of db.groups) {
     const eventDate = new Date(`${g.date}T${g.time}:00`);
+    // aggiorna hasExpired
     g.hasExpired = eventDate < now;
 
+    // appena passata la data: incrementa partecipazioni (una volta sola)
     if (!g.attendanceProcessed && now > eventDate) {
       g.attendanceProcessed = true;
       g.participants.forEach(name => {
@@ -306,6 +375,7 @@ cron.schedule('*/5 * * * *', async () => {
       });
     }
 
+    // dopo 24 ore manda le notifiche di voto (una per utente)
     const msDiff = now - eventDate;
     if (msDiff >= 24 * 60 * 60 * 1000) {
       g.voteRequestsSent = g.voteRequestsSent || {};
@@ -338,11 +408,6 @@ cron.schedule('*/5 * * * *', async () => {
   console.log('🕒 job: controllo eventi e notifiche voto OK');
 });
 
-// ---------- start ----------
-app.listen(PORT, () => {
-  console.log(`✅ Server avviato su http://localhost:${PORT}`);
-});
-
 // === UPLOAD IMMAGINI (Render: storage effimero in /tmp) ===
 const multer = require('multer');
 const path = require('path');
@@ -360,9 +425,17 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
+// Servi i file caricati
 app.use('/uploads', express.static(UPLOAD_DIR));
+
+// Endpoint di upload (campo "file")
 app.post('/api/upload', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Nessun file' });
   const url = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
   res.json({ url });
+});
+
+// ---------- start ----------
+app.listen(PORT, () => {
+  console.log(`✅ Server avviato su http://localhost:${PORT}`);
 });
