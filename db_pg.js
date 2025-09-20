@@ -20,9 +20,13 @@ async function query(text, params) {
 }
 
 async function ping() {
-  // una query banalissima
-  const res = await query('select 1 as ok');
-  return res.rows[0].ok === 1;
+  try {
+    const res = await query('select 1 as ok');
+    return res.rows[0].ok === 1;
+  } catch (e) {
+    console.error('DB ping error:', e);
+    throw e; // rilancia per farlo arrivare fino al /health/db
+  }
 }
 
 module.exports = { pool, query, ping };
