@@ -318,7 +318,7 @@ app.listen(PORT, () => {
   console.log(`✅ Server avviato su http://localhost:${PORT}`);
 });
 // === UPLOAD IMMAGINI (Render: storage effimero in /tmp) ===
-import multer from 'multer';
+const multer = require('multer');
 import path from 'path';
 import fs from 'fs';
 
