@@ -6,6 +6,7 @@ const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
 const cron = require('node-cron');
 const { readDB, writeDB } = require('./db');
+const dbpg = require('./db_pg'); // <— nuovo
 
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || 'changeme';
@@ -31,6 +32,16 @@ function auth(req, res, next) {
     return res.status(401).json({ error: 'Invalid token' });
   }
 }
+
+app.get('/health/db', async (req, res) => {
+  try {
+    const ok = await dbpg.ping();
+    res.json({ ok: true, db: ok ? 'connected' : 'unknown' });
+  } catch (e) {
+    console.error('DB health error:', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 function computeStatus(profile) {
   const attended = profile.eventsAttended || 0;
