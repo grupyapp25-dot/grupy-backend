@@ -1,36 +1,54 @@
 // db_pg.js — client Postgres per Supabase (Render richiede SSL)
 const { Pool } = require('pg');
 
-// Prendi la connessione dalle env
 let raw = process.env.DATABASE_URL || '';
 
+if (!raw) {
+  console.error('❌ DATABASE_URL non impostata nelle env vars');
+}
+
+// Log mascherato (solo diagnostica)
 const masked = raw ? raw.replace(/:[^@]+@/, ':****@') : '(undefined)';
 console.log('🧪 db_pg.js sees DATABASE_URL =', masked);
 
-// Normalizza: pg è più felice con lo schema "postgres://" invece di "postgresql://"
+// 1) Normalizza schema: "postgresql://" -> "postgres://"
 if (raw && raw.startsWith('postgresql://')) {
   raw = 'postgres://' + raw.slice('postgresql://'.length);
 }
 
-// (opzionale ma utile) Se la password contiene caratteri speciali (come @) e NON è url-encoded,
-// puoi forzare l’encoding automaticamente. Nel tuo caso è già %40, quindi non dovrebbe servire.
-// Lascio comunque il fix: se trovi un "@" PRIMA della @ del dominio, facciamo encode della password.
+let cfg;
 try {
+  // 2) Parsiamo noi l’URL in modo robusto
   const u = new URL(raw);
-  // Se nello username:password esiste un '@' non codificato, lo sistemiamo
-  if (u.password && /@/.test(decodeURIComponent(u.password))) {
-    u.password = encodeURIComponent(decodeURIComponent(u.password));
-    raw = u.toString();
-  }
-} catch (_) {
-  // Se raw non è un URL valido, lasciamo com’è; ci penserà il log del ping a dircelo
+
+  // Nota: pathname è tipo "/postgres" -> togliamo lo slash iniziale
+  const database = u.pathname ? u.pathname.replace(/^\//, '') : undefined;
+
+  cfg = {
+    host: u.hostname,
+    port: u.port ? Number(u.port) : 5432,
+    database,
+    user: decodeURIComponent(u.username || ''),
+    password: decodeURIComponent(u.password || ''),
+    // 3) SSL per Render+Supabase
+    ssl: { rejectUnauthorized: false },
+  };
+} catch (e) {
+  console.error('❌ DATABASE_URL non è un URL valido:', e.message || e);
+  // Metto una cfg che fallirà subito ma con errore chiaro
+  cfg = { host: 'invalid', database: 'invalid', user: 'invalid', password: 'invalid' };
 }
 
-const pool = new Pool({
-  connectionString: raw,
-  // Render + Supabase: serve SSL
-  ssl: { rejectUnauthorized: false },
+// (log mini utile per debugging — senza password)
+console.log('🧪 PG config:', {
+  host: cfg.host,
+  port: cfg.port,
+  database: cfg.database,
+  user: cfg.user ? '(present)' : '(empty)',
+  ssl: cfg.ssl ? 'on' : 'off',
 });
+
+const pool = new Pool(cfg);
 
 // Helper generico per query
 async function query(text, params) {
