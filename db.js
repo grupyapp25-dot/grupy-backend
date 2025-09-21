@@ -1,59 +1,65 @@
-// db.js
-const fs = require('fs').promises;
+// db.js — storage JSON robusto su file (funziona anche su Render - FS effimero)
+const fs = require('fs');
 const path = require('path');
 
-// Usa /tmp su Render, altrimenti locale db.json
-const DATA_FILE = process.env.DATA_FILE || (
-  process.env.RENDER ? '/tmp/db.json' : path.join(__dirname, 'db.json')
-);
+const DB_DIR = process.env.DB_DIR || path.join(__dirname, 'data');
+const DB_FILE = process.env.DB_FILE || path.join(DB_DIR, 'db.json');
 
-// Struttura iniziale del “DB”
-const INITIAL_DB = {
+const DEFAULT_DB = {
   users: [],
   groups: [],
   notifications: [],
-  profiles: {},   // { [username]: { feedback:{up,down}, eventsAttended, status } }
-  posts: []       // feed locale (foto/testi) se usi anche questa parte
+  profiles: {},
+  posts: []
 };
 
-async function ensureFile() {
+function ensureDirFile() {
   try {
-    await fs.access(DATA_FILE);
-  } catch {
-    // se non esiste, crealo con contenuto iniziale
-    await fs.writeFile(DATA_FILE, JSON.stringify(INITIAL_DB, null, 2), 'utf8');
+    if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
+    if (!fs.existsSync(DB_FILE)) {
+      fs.writeFileSync(DB_FILE, JSON.stringify(DEFAULT_DB, null, 2));
+    }
+  } catch (e) {
+    console.error('❌ Impossibile creare DB file:', e);
+    throw e;
   }
 }
 
+function safeHydrate(obj) {
+  const d = obj && typeof obj === 'object' ? obj : {};
+  return {
+    users: Array.isArray(d.users) ? d.users : [],
+    groups: Array.isArray(d.groups) ? d.groups : [],
+    notifications: Array.isArray(d.notifications) ? d.notifications : [],
+    profiles: d.profiles && typeof d.profiles === 'object' ? d.profiles : {},
+    posts: Array.isArray(d.posts) ? d.posts : []
+  };
+}
+
 async function readDB() {
-  await ensureFile();
+  ensureDirFile();
   try {
-    const raw = await fs.readFile(DATA_FILE, 'utf8');
-    const json = JSON.parse(raw);
-    // fallback in caso di file vuoto o corrotto
-    return {
-      users: Array.isArray(json.users) ? json.users : [],
-      groups: Array.isArray(json.groups) ? json.groups : [],
-      notifications: Array.isArray(json.notifications) ? json.notifications : [],
-      profiles: typeof json.profiles === 'object' && json.profiles ? json.profiles : {},
-      posts: Array.isArray(json.posts) ? json.posts : []
-    };
+    const raw = fs.readFileSync(DB_FILE, 'utf8');
+    if (!raw || raw.trim() === '') {
+      // file vuoto -> reset
+      fs.writeFileSync(DB_FILE, JSON.stringify(DEFAULT_DB, null, 2));
+      return { ...DEFAULT_DB };
+    }
+    const parsed = JSON.parse(raw);
+    return safeHydrate(parsed);
   } catch (e) {
-    // se parse fallisce, riparti pulito
-    await fs.writeFile(DATA_FILE, JSON.stringify(INITIAL_DB, null, 2), 'utf8');
-    return { ...INITIAL_DB };
+    // file corrotto -> resetta e riparti pulito
+    console.error('⚠️  DB JSON corrotto; reset:', e.message);
+    fs.writeFileSync(DB_FILE, JSON.stringify(DEFAULT_DB, null, 2));
+    return { ...DEFAULT_DB };
   }
 }
 
 async function writeDB(db) {
-  const safe = {
-    users: Array.isArray(db.users) ? db.users : [],
-    groups: Array.isArray(db.groups) ? db.groups : [],
-    notifications: Array.isArray(db.notifications) ? db.notifications : [],
-    profiles: typeof db.profiles === 'object' && db.profiles ? db.profiles : {},
-    posts: Array.isArray(db.posts) ? db.posts : []
-  };
-  await fs.writeFile(DATA_FILE, JSON.stringify(safe, null, 2), 'utf8');
+  ensureDirFile();
+  const data = safeHydrate(db);
+  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+  return true;
 }
 
-module.exports = { readDB, writeDB, DATA_FILE };
+module.exports = { readDB, writeDB, DB_DIR, DB_FILE };

@@ -1,3 +1,4 @@
+// server.js
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -5,11 +6,13 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
 const cron = require('node-cron');
-const { readDB, writeDB } = require('./db');
-const dbpg = require('./db_pg'); // client Postgres opzionale (health/info)
+const path = require('path');
+const fs = require('fs');
+const multer = require('multer');
 
-// ✨ NEW: mailer per invio email
-const { sendMail } = require('./utils/mailer');
+const { readDB, writeDB } = require('./db');
+const dbpg = require('./db_pg'); // Postgres opzionale (health/info)
+const { sendConfirmationEmail } = require('./utils/mailer'); // <-- invio email
 
 // --- DEBUG ENV (puoi rimuovere quando vuoi) ---
 const rawConn = process.env.DATABASE_URL || '';
@@ -21,6 +24,7 @@ console.log('🔧 DATABASE_URL at startup =', maskedConn);
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || 'changeme';
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL; // es: https://grupy-backend.onrender.com
 
 const app = express();
 app.use(cors({ origin: CORS_ORIGIN }));
@@ -55,16 +59,16 @@ function computeStatus(profile) {
 }
 
 // ---------- base ----------
-app.get('/', (req, res) => res.json({ ok: true, service: 'Grupy API' }));
-app.get('/health', (req, res) => res.json({ ok: true }));
-app.get('/env-check', (req, res) => {
+app.get('/', (_req, res) => res.json({ ok: true, service: 'Grupy API' }));
+app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/env-check', (_req, res) => {
   const raw = process.env.DATABASE_URL || '';
   const masked = raw ? raw.replace(/:[^@]+@/, ':****@') : '(undefined)';
   res.json({ has_DATABASE_URL: !!raw, DATABASE_URL_preview: masked });
 });
 
-// ---------- HEALTH DB (Postgres) ----------
-app.get('/health/db', async (req, res) => {
+// ---------- HEALTH DB (Postgres opzionale) ----------
+app.get('/health/db', async (_req, res) => {
   try {
     const ok = await dbpg.ping();
     res.json({ ok: true, db: ok ? 'connected' : 'unknown' });
@@ -74,8 +78,7 @@ app.get('/health/db', async (req, res) => {
   }
 });
 
-// Info DB Postgres
-app.get('/health/db-info', async (req, res) => {
+app.get('/health/db-info', async (_req, res) => {
   try {
     const r = await dbpg.query('select now() as now, version() as pg');
     res.json({ ok: true, now: r.rows[0].now, version: r.rows[0].pg });
@@ -103,28 +106,15 @@ app.get('/health/db-file', async (_req, res) => {
 });
 
 // ---------- AUTH ----------
-
-// ✨ NEW: controllo disponibilità username
-app.get('/api/users/check-username', async (req, res) => {
-  try {
-    const { username } = req.query || {};
-    if (!username) return res.status(400).json({ available: false, error: 'username mancante' });
-    const db = await readDB();
-    const exists = db.users.some(u => u.username.toLowerCase() === String(username).toLowerCase());
-    res.json({ available: !exists });
-  } catch (e) {
-    console.error('CHECK USERNAME error:', e);
-    res.status(500).json({ available: true, error: 'server' });
-  }
-});
-
 app.post('/api/users/register', async (req, res) => {
   try {
     const { username, password, email } = req.body || {};
-    if (!username || !password) return res.status(400).json({ error: 'username e password richiesti' });
+    if (!username || !password) {
+      return res.status(400).json({ error: 'username e password richiesti' });
+    }
 
     const db = await readDB();
-    if (db.users.find(u => u.username.toLowerCase() === String(username).toLowerCase())) {
+    if (db.users.find(u => (u.username || '').toLowerCase() === String(username).toLowerCase())) {
       return res.status(409).json({ error: 'Username già in uso' });
     }
 
@@ -132,9 +122,9 @@ app.post('/api/users/register', async (req, res) => {
     const user = {
       id: uuidv4(),
       username,
-      passwordHash: hash,
-      // ✨ NEW: memorizziamo anche l'email se fornita
       email: email || '',
+      emailVerified: false,
+      passwordHash: hash,
       eta: '',
       citta: '',
       descrizione: '',
@@ -159,7 +149,7 @@ app.post('/api/users/register', async (req, res) => {
       user: {
         id: user.id,
         username: user.username,
-        email: user.email || '',
+        email: user.email,
         profilePhoto: user.profilePhoto,
         city: user.city
       }
@@ -176,7 +166,7 @@ app.post('/api/users/login', async (req, res) => {
     if (!username || !password) return res.status(400).json({ error: 'username e password richiesti' });
 
     const db = await readDB();
-    const user = db.users.find(u => u.username.toLowerCase() === String(username).toLowerCase());
+    const user = db.users.find(u => (u.username || '').toLowerCase() === String(username).toLowerCase());
     if (!user) return res.status(401).json({ error: 'Credenziali non valide' });
 
     const ok = await bcrypt.compare(password, user.passwordHash || '');
@@ -215,7 +205,6 @@ app.get('/api/users/me', auth, async (req, res) => {
   }
 });
 
-// aggiorna dati profilo base (eta, citta, descrizione, profilePhoto url, city, email)
 app.put('/api/users/me', auth, async (req, res) => {
   try {
     const { eta, citta, descrizione, profilePhoto, city, email } = req.body || {};
@@ -227,7 +216,6 @@ app.put('/api/users/me', auth, async (req, res) => {
     if (descrizione !== undefined) user.descrizione = descrizione;
     if (profilePhoto !== undefined) user.profilePhoto = profilePhoto;
     if (city !== undefined) user.city = city;
-    // ✨ NEW: permettiamo di salvare/aggiornare l'email
     if (email !== undefined) user.email = email;
     await writeDB(db);
     res.json({ ok: true, user });
@@ -237,28 +225,26 @@ app.put('/api/users/me', auth, async (req, res) => {
   }
 });
 
-// ✨ NEW: invio email di conferma
+// ---------- EMAIL: invio conferma ----------
 app.post('/api/users/send-confirmation', async (req, res) => {
   try {
     const { email } = req.body || {};
-    if (!email) return res.status(400).json({ error: 'Email mancante' });
+    if (!email) return res.status(400).json({ error: 'email richiesta' });
 
-    await sendMail({
-      to: email,
-      subject: 'Conferma la tua email - Grupy',
-      text: 'Ciao! Abbiamo registrato il tuo account su Grupy. Controlla la tua casella email.',
-      html: '<h2>Benvenuto in Grupy 🎉</h2><p>Abbiamo inviato una mail di conferma: controlla la tua casella di posta (anche spam).</p>',
-    });
+    const base = PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`;
+    const token = Buffer.from(`${email}|${Date.now()}`).toString('base64url'); // placeholder
+    const confirmUrl = `${base}/confirm-email?token=${token}`;
 
-    res.json({ ok: true, sent: true });
-  } catch (err) {
-    console.error('send-confirmation error:', err);
-    res.status(500).json({ ok: false, error: 'Invio email fallito' });
+    const info = await sendConfirmationEmail(email, confirmUrl);
+    res.json({ ok: true, sent: true, messageId: info.messageId, confirmUrl });
+  } catch (e) {
+    console.error('send-confirmation error:', e);
+    res.status(500).json({ ok: false, error: e.message || 'Mailer error' });
   }
 });
 
 // ---------- GROUPS ----------
-app.get('/api/groups', auth, async (req, res) => {
+app.get('/api/groups', auth, async (_req, res) => {
   try {
     const db = await readDB();
     res.json(db.groups);
@@ -286,7 +272,7 @@ app.post('/api/groups', auth, async (req, res) => {
       participants: [req.user.username],
       createdAt: new Date().toISOString(),
       attendanceProcessed: false,
-      voteRequestsSent: {}, // { [username]: true }
+      voteRequestsSent: {},
       hasExpired: false
     };
     db.groups.push(group);
@@ -365,13 +351,11 @@ app.post('/api/notifications/mark-read', auth, async (req, res) => {
 // ---------- VOTI post-evento ----------
 app.post('/api/groups/:id/votes', auth, async (req, res) => {
   try {
-    // body: { votes: { [username]: -1|0|1 }, imageUrl?: string }
     const { votes = {}, imageUrl } = req.body || {};
     const db = await readDB();
     const g = db.groups.find(x => x.id === req.params.id);
     if (!g) return res.status(404).json({ error: 'Gruppo non trovato' });
 
-    // aggiorna feedback per ciascun utente votato
     Object.entries(votes).forEach(([name, val]) => {
       if (!db.profiles[name]) {
         db.profiles[name] = { feedback: { up: 0, down: 0 }, eventsAttended: 0, status: 'Nuovo utente' };
@@ -381,7 +365,6 @@ app.post('/api/groups/:id/votes', auth, async (req, res) => {
       db.profiles[name].status = computeStatus(db.profiles[name]);
     });
 
-    // se c'è una foto, crea un post (semplice)
     if (imageUrl) {
       db.posts.push({
         id: uuidv4(),
@@ -411,10 +394,8 @@ cron.schedule('*/5 * * * *', async () => {
 
   for (const g of db.groups) {
     const eventDate = new Date(`${g.date}T${g.time}:00`);
-    // aggiorna hasExpired
     g.hasExpired = eventDate < now;
 
-    // appena passata la data: incrementa partecipazioni (una volta sola)
     if (!g.attendanceProcessed && now > eventDate) {
       g.attendanceProcessed = true;
       g.participants.forEach(name => {
@@ -426,7 +407,6 @@ cron.schedule('*/5 * * * *', async () => {
       });
     }
 
-    // dopo 24 ore manda le notifiche di voto (una per utente)
     const msDiff = now - eventDate;
     if (msDiff >= 24 * 60 * 60 * 1000) {
       g.voteRequestsSent = g.voteRequestsSent || {};
@@ -460,10 +440,6 @@ cron.schedule('*/5 * * * *', async () => {
 });
 
 // === UPLOAD IMMAGINI (Render: storage effimero in /tmp) ===
-const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
-
 const UPLOAD_DIR = '/tmp/uploads';
 try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch {}
 
@@ -476,10 +452,8 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// Servi i file caricati
 app.use('/uploads', express.static(UPLOAD_DIR));
 
-// Endpoint di upload (campo "file")
 app.post('/api/upload', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Nessun file' });
   const url = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
