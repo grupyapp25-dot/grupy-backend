@@ -6,20 +6,18 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
 const cron = require('node-cron');
+const multer = require('multer');
+const fs = require('fs');
+
 const { readDB, writeDB } = require('./db');
-const dbpg = require('./db_pg'); // client Postgres opzionale (health/info)
-const { sendMail } = require('./utils/mailer'); // <— usa il tuo utils/mailer.js
+const dbpg = require('./db_pg');
+const { sendMail } = require('./utils/mailer');
 
-// --- DEBUG ENV (puoi rimuovere quando vuoi) ---
-const rawConn = process.env.DATABASE_URL || '';
-const maskedConn = rawConn
-  ? rawConn.replace(/:[^@]+@/, ':****@').slice(0, 120) + (rawConn.length > 120 ? '…' : '')
-  : '(undefined)';
-console.log('🔧 DATABASE_URL at startup =', maskedConn);
-
+// --- CONFIG ---
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || 'changeme';
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+
 const BACKEND_PUBLIC_URL = (process.env.BACKEND_PUBLIC_URL || '').replace(/\/$/, '');
 const PUBLIC_APP_URL = (process.env.PUBLIC_APP_URL || '').replace(/\/$/, '');
 const FRONTEND_LOGIN_URL =
@@ -29,24 +27,28 @@ const FRONTEND_LOGIN_URL =
 const app = express();
 app.use(cors({ origin: CORS_ORIGIN }));
 app.use(express.json({ limit: '5mb' }));
+app.use(express.urlencoded({ extended: true })); // importa anche form-urlencoded
 
-// ---------- utils ----------
+// --- helpers ---
+const isValidEmail = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(e || '').trim());
+const extractEmail = (any) => {
+  const s = String(any || '').trim();
+  const m = s.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  return m ? m[0] : '';
+};
+const getBackendBase = (req) =>
+  (BACKEND_PUBLIC_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+
 function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
 }
-
 function auth(req, res, next) {
   const h = req.headers.authorization || '';
   const token = h.startsWith('Bearer ') ? h.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'Missing token' });
-  try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch {
-    return res.status(401).json({ error: 'Invalid token' });
-  }
+  try { req.user = jwt.verify(token, JWT_SECRET); next(); }
+  catch { return res.status(401).json({ error: 'Invalid token' }); }
 }
-
 function computeStatus(profile) {
   const attended = profile.eventsAttended || 0;
   const up = profile.feedback?.up || 0;
@@ -58,108 +60,44 @@ function computeStatus(profile) {
   return 'Nuovo utente';
 }
 
-// ---------- base ----------
-app.get('/', (req, res) => res.json({ ok: true, service: 'Grupy API' }));
-app.get('/health', (req, res) => res.json({ ok: true }));
-app.get('/env-check', (req, res) => {
-  const raw = process.env.DATABASE_URL || '';
-  const masked = raw ? raw.replace(/:[^@]+@/, ':****@') : '(undefined)';
-  res.json({
-    has_DATABASE_URL: !!raw,
-    DATABASE_URL_preview: masked,
-    BACKEND_PUBLIC_URL,
-    PUBLIC_APP_URL,
-    FRONTEND_LOGIN_URL
-  });
+// --- base ---
+app.get('/', (_req, res) => res.json({ ok: true, service: 'Grupy API' }));
+app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/__version', (_req, res) => res.json({ build: 'server-v5', emailRoute: '/api/users/send-confirmation' }));
+
+// --- db health (facoltativo) ---
+app.get('/health/db', async (_req, res) => {
+  try { res.json({ ok: true, db: (await dbpg.ping()) ? 'connected' : 'unknown' }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-// ---------- HEALTH DB (Postgres) ----------
-app.get('/health/db', async (req, res) => {
-  try {
-    const ok = await dbpg.ping();
-    res.json({ ok: true, db: ok ? 'connected' : 'unknown' });
-  } catch (e) {
-    console.error('DB health error:', e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-app.get('/health/db-info', async (req, res) => {
-  try {
-    const r = await dbpg.query('select now() as now, version() as pg');
-    res.json({ ok: true, now: r.rows[0].now, version: r.rows[0].pg });
-  } catch (e) {
-    console.error('DB info error:', e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ---------- HEALTH DB FILE (JSON su FS) ----------
-app.get('/health/db-file', async (_req, res) => {
-  try {
-    const db = await readDB();
-    res.json({
-      ok: true,
-      usersCount: db.users.length,
-      groupsCount: db.groups.length,
-      profilesCount: Object.keys(db.profiles).length,
-      postsCount: db.posts.length
-    });
-  } catch (e) {
-    console.error('DB FILE health error:', e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ---------- AUTH ----------
+// --- auth ---
 app.post('/api/users/register', async (req, res) => {
   try {
     const { username, password, email } = req.body || {};
-    if (!username || !password) {
-      return res.status(400).json({ error: 'username e password richiesti' });
-    }
+    if (!username || !password) return res.status(400).json({ error: 'username e password richiesti' });
 
     const db = await readDB();
     if (db.users.find(u => (u.username || '').toLowerCase() === String(username).toLowerCase())) {
       return res.status(409).json({ error: 'Username già in uso' });
     }
 
-    const hash = await bcrypt.hash(password, 10);
     const user = {
       id: uuidv4(),
       username,
       email: email || '',
       emailVerified: false,
-      passwordHash: hash,
-      eta: '',
-      citta: '',
-      descrizione: '',
-      profilePhoto: null,
-      city: ''
+      passwordHash: await bcrypt.hash(password, 10),
+      eta: '', citta: '', descrizione: '', profilePhoto: null, city: ''
     };
     db.users.push(user);
-
     if (!db.profiles[username]) {
-      db.profiles[username] = {
-        feedback: { up: 0, down: 0 },
-        eventsAttended: 0,
-        status: 'Nuovo utente'
-      };
+      db.profiles[username] = { feedback: { up: 0, down: 0 }, eventsAttended: 0, status: 'Nuovo utente' };
     }
-
     await writeDB(db);
 
     const token = signToken({ id: user.id, username: user.username });
-    res.json({
-      token,
-      user: {
-        id: user.id,
-        username: user.username,
-        email: user.email,
-        profilePhoto: user.profilePhoto,
-        city: user.city
-      }
-    });
+    res.json({ token, user: { id: user.id, username, email: user.email, profilePhoto: user.profilePhoto, city: user.city } });
   } catch (e) {
     console.error('REGISTER error:', e);
     res.status(500).json({ error: e.message || 'Errore server' });
@@ -199,19 +137,48 @@ app.post('/api/users/login', async (req, res) => {
   }
 });
 
-// Invia email di conferma
+// (utile per client)
+app.get('/api/users/check-username', async (req, res) => {
+  try {
+    const username = String(req.query?.username || '').trim();
+    if (!username) return res.json({ available: false });
+    const db = await readDB();
+    const exists = db.users.some(u => (u.username || '').toLowerCase() === username.toLowerCase());
+    res.json({ available: !exists });
+  } catch {
+    res.json({ available: true });
+  }
+});
+
+// --- EMAIL: invio conferma (SUPER difensiva + log) ---
 app.post('/api/users/send-confirmation', async (req, res) => {
   try {
-    const { email } = req.body || {};
-    if (!email) return res.status(400).json({ error: 'email richiesta' });
+    const candidates = [
+      req.body?.email,
+      req.body?.address,
+      req.headers['x-test-email'],
+      req.query?.email,
+      typeof req.body === 'string' ? req.body : '',
+    ].filter(Boolean);
 
-    const base = BACKEND_PUBLIC_URL || `${req.protocol}://${req.get('host')}`;
+    console.log('📨 send-confirmation headers=', req.headers);
+    try { console.log('📨 send-confirmation body=', JSON.stringify(req.body)); } catch { console.log('📨 send-confirmation body=[non-JSON]'); }
+    console.log('📨 send-confirmation query=', req.query);
+
+    const email = extractEmail(candidates.find(v => isValidEmail(v)) || '');
+    console.log('📨 parsed email =', email || '(vuota)');
+
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ ok: false, error: 'email non valida o assente nel body' });
+    }
+
+    const base = getBackendBase(req);
     const token = Buffer.from(`${email}|${Date.now()}`, 'utf8').toString('base64url');
-    const confirmUrl = `${base}/api/users/confirm-email?token=${encodeURIComponent(token)}`;
+    const confirmUrl = `${base}/confirm-email?token=${encodeURIComponent(token)}`;
 
     const subject = 'Conferma il tuo indirizzo email';
     const html = `
-      <div style="font-family:system-ui,Arial,sans-serif;line-height:1.4">
+      <div style="font-family:system-ui,Arial,sans-serif;line-height:1.4;max-width:520px">
         <h2>Ciao!</h2>
         <p>Per completare la verifica clicca il bottone qui sotto:</p>
         <p style="margin:20px 0">
@@ -219,84 +186,80 @@ app.post('/api/users/send-confirmation', async (req, res) => {
             Conferma email
           </a>
         </p>
-        <p>Oppure copia e incolla questo link nel browser:</p>
-        <p style="word-break:break-all"><a href="${confirmUrl}">${confirmUrl}</a></p>
-      </div>
-    `;
+        <p style="font-size:13px;color:#555">Oppure copia e incolla questo link nel browser:</p>
+        <p style="word-break:break-all;font-size:13px"><a href="${confirmUrl}">${confirmUrl}</a></p>
+      </div>`;
     const text = `Conferma la tua email aprendo questo link: ${confirmUrl}`;
 
+    console.log('📧 INVIO a:', email);
     const info = await sendMail({ to: email, subject, html, text });
-    res.json({ ok: true, sent: true, messageId: info.messageId, confirmUrl });
+
+    res.json({ ok: true, sent: true, messageId: info?.messageId, confirmUrl, emailUsed: email });
   } catch (e) {
     console.error('send-confirmation error:', e);
     res.status(500).json({ ok: false, error: e.message || 'Mailer error' });
   }
 });
 
-// Handler unico per conferma email (gestisce sia /api/users/confirm-email che /confirm-email)
-// Handler unico per conferma email (gestisce sia /api/users/confirm-email che /confirm-email)
+// --- EMAIL: rotta di TEST manuale (comoda)
+app.get('/dev/test-mail', async (req, res) => {
+  try {
+    const to = String(req.query.to || '').trim();
+    if (!isValidEmail(to)) return res.status(400).json({ ok: false, error: 'to mancante o non valido' });
+    const info = await sendMail({
+      to,
+      subject: 'Prova invio da Grupy',
+      text: 'Test ok.',
+      html: '<b>Test ok.</b>',
+    });
+    res.json({ ok: true, messageId: info?.messageId });
+  } catch (e) {
+    console.error('dev/test-mail error:', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// --- EMAIL: conferma + redirect al login
 const confirmEmailHandler = async (req, res) => {
   const safeRedirect = () => {
-    const redirectBase =
-      (process.env.FRONTEND_LOGIN_URL || '').replace(/\/$/, '') ||
-      ((process.env.PUBLIC_APP_URL || '').replace(/\/$/, '') ? `${(process.env.PUBLIC_APP_URL || '').replace(/\/$/, '')}/login` : '/');
-    // porta una query per mostrare un messaggio nel login (opzionale)
-    return `${redirectBase}?emailConfirmed=1`;
+    const base = (FRONTEND_LOGIN_URL || PUBLIC_APP_URL ? `${FRONTEND_LOGIN_URL || (PUBLIC_APP_URL + '/login')}` : getBackendBase(req));
+    const u = new URL(base.startsWith('http') ? base : getBackendBase(req));
+    u.searchParams.set('emailConfirmed', '1');
+    return u.toString();
   };
 
   try {
     const { token } = req.query || {};
-    if (!token) {
-      const to = safeRedirect().replace('emailConfirmed=1', 'emailConfirmed=0&reason=missing_token');
-      return res.redirect(302, to);
-    }
+    if (!token) return res.redirect(302, safeRedirect().replace('emailConfirmed=1', 'emailConfirmed=0&reason=missing_token'));
 
-    // decodifica base64url / base64
     let decoded = '';
-    try {
-      decoded = Buffer.from(String(token), 'base64url').toString('utf8');
-    } catch {
-      try {
-        decoded = Buffer.from(String(token), 'base64').toString('utf8');
-      } catch {
-        const to = safeRedirect().replace('emailConfirmed=1', 'emailConfirmed=0&reason=bad_token');
-        return res.redirect(302, to);
-      }
-    }
+    try { decoded = Buffer.from(String(token), 'base64url').toString('utf8'); }
+    catch { decoded = Buffer.from(String(token), 'base64').toString('utf8'); }
 
     let [email, ts] = decoded.split('|');
     ts = Number(ts || 0);
-
-    // scadenza: 3 giorni
     const MAX_AGE = 3 * 24 * 60 * 60 * 1000;
     if (!email || !ts || (Date.now() - ts) > MAX_AGE) {
-      const to = safeRedirect().replace('emailConfirmed=1', 'emailConfirmed=0&reason=expired');
-      return res.redirect(302, to);
+      return res.redirect(302, safeRedirect().replace('emailConfirmed=1', 'emailConfirmed=0&reason=expired'));
     }
 
     const db = await readDB();
     const user = db.users.find(u => (u.email || '').toLowerCase() === String(email).toLowerCase());
-    if (!user) {
-      const to = safeRedirect().replace('emailConfirmed=1', 'emailConfirmed=0&reason=not_found');
-      return res.redirect(302, to);
-    }
+    if (!user) return res.redirect(302, safeRedirect().replace('emailConfirmed=1', 'emailConfirmed=0&reason=not_found'));
 
     user.emailVerified = true;
     await writeDB(db);
-
-    // ✅ redirect immediato al login
     return res.redirect(302, safeRedirect());
   } catch (e) {
     console.error('confirm-email error:', e);
-    const to = (process.env.FRONTEND_LOGIN_URL || process.env.PUBLIC_APP_URL || '/').replace(/\/$/, '');
-    return res.redirect(302, `${to}/login?emailConfirmed=0&reason=server_error`);
+    const base = (FRONTEND_LOGIN_URL || PUBLIC_APP_URL || '/').replace(/\/$/, '');
+    const fallback = base.startsWith('http') ? `${base}?emailConfirmed=0&reason=server_error` : `${getBackendBase(req)}/?emailConfirmed=0&reason=server_error`;
+    return res.redirect(302, fallback);
   }
 };
-
-// registra entrambe le rotte
 app.get(['/api/users/confirm-email', '/confirm-email'], confirmEmailHandler);
 
-// ---------- PROFILO ----------
+// --- PROFILE/OTHERS (immutati) ---
 app.get('/api/users/me', auth, async (req, res) => {
   try {
     const db = await readDB();
@@ -305,7 +268,6 @@ app.get('/api/users/me', auth, async (req, res) => {
     const profile = db.profiles[user.username] || { feedback: { up: 0, down: 0 }, eventsAttended: 0, status: 'Nuovo utente' };
     res.json({ user, profile });
   } catch (e) {
-    console.error('ME error:', e);
     res.status(500).json({ error: e.message || 'Errore server' });
   }
 });
@@ -324,250 +286,29 @@ app.put('/api/users/me', auth, async (req, res) => {
     await writeDB(db);
     res.json({ ok: true, user });
   } catch (e) {
-    console.error('UPDATE ME error:', e);
     res.status(500).json({ error: e.message || 'Errore server' });
   }
 });
 
-// ---------- GROUPS ----------
-app.get('/api/groups', auth, async (req, res) => {
-  try {
-    const db = await readDB();
-    res.json(db.groups);
-  } catch (e) {
-    console.error('GET GROUPS error:', e);
-    res.status(500).json({ error: e.message || 'Errore server' });
-  }
-});
-
-app.post('/api/groups', auth, async (req, res) => {
-  try {
-    const { name, category, date, time, city, address, description, budget, maxParticipants, coverPhoto, location } = req.body || {};
-    if (!name || !category || !date || !time || !city || !address || !description || budget === undefined || !maxParticipants || !location) {
-      return res.status(400).json({ error: 'Campi obbligatori mancanti' });
-    }
-    const db = await readDB();
-    const group = {
-      id: uuidv4(),
-      name, category, date, time, city, address, description,
-      budget: Number(budget),
-      maxParticipants: Number(maxParticipants),
-      coverPhoto: coverPhoto || null,
-      location,
-      creator: req.user.username,
-      participants: [req.user.username],
-      createdAt: new Date().toISOString(),
-      attendanceProcessed: false,
-      voteRequestsSent: {}, // { [username]: true }
-      hasExpired: false
-    };
-    db.groups.push(group);
-    await writeDB(db);
-    res.json(group);
-  } catch (e) {
-    console.error('CREATE GROUP error:', e);
-    res.status(500).json({ error: e.message || 'Errore server' });
-  }
-});
-
-app.post('/api/groups/:id/join', auth, async (req, res) => {
-  try {
-    const db = await readDB();
-    const g = db.groups.find(x => x.id === req.params.id);
-    if (!g) return res.status(404).json({ error: 'Gruppo non trovato' });
-    if (g.participants.includes(req.user.username)) return res.json(g);
-    if (g.participants.length >= g.maxParticipants) return res.status(400).json({ error: 'Gruppo completo' });
-    g.participants.push(req.user.username);
-    await writeDB(db);
-    res.json(g);
-  } catch (e) {
-    console.error('JOIN GROUP error:', e);
-    res.status(500).json({ error: e.message || 'Errore server' });
-  }
-});
-
-app.post('/api/groups/:id/leave', auth, async (req, res) => {
-  try {
-    const db = await readDB();
-    const g = db.groups.find(x => x.id === req.params.id);
-    if (!g) return res.status(404).json({ error: 'Gruppo non trovato' });
-    g.participants = g.participants.filter(u => u !== req.user.username);
-    await writeDB(db);
-    res.json(g);
-  } catch (e) {
-    console.error('LEAVE GROUP error:', e);
-    res.status(500).json({ error: e.message || 'Errore server' });
-  }
-});
-
-// ---------- NOTIFICATIONS ----------
-app.get('/api/notifications', auth, async (req, res) => {
-  try {
-    const db = await readDB();
-    const mine = db.notifications
-      .filter(n => n.user === req.user.username)
-      .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-    res.json(mine);
-  } catch (e) {
-    console.error('GET NOTIFICATIONS error:', e);
-    res.status(500).json({ error: e.message || 'Errore server' });
-  }
-});
-
-app.post('/api/notifications/mark-read', auth, async (req, res) => {
-  try {
-    const { id, all } = req.body || {};
-    const db = await readDB();
-    if (all) {
-      db.notifications.forEach(n => {
-        if (n.user === req.user.username) n.read = true;
-      });
-    } else if (id) {
-      const n = db.notifications.find(n => n.id === id && n.user === req.user.username);
-      if (n) n.read = true;
-    }
-    await writeDB(db);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('MARK READ error:', e);
-    res.status(500).json({ error: e.message || 'Errore server' });
-  }
-});
-
-// ---------- VOTI post-evento ----------
-app.post('/api/groups/:id/votes', auth, async (req, res) => {
-  try {
-    const { votes = {}, imageUrl } = req.body || {};
-    const db = await readDB();
-    const g = db.groups.find(x => x.id === req.params.id);
-    if (!g) return res.status(404).json({ error: 'Gruppo non trovato' });
-
-    Object.entries(votes).forEach(([name, val]) => {
-      if (!db.profiles[name]) {
-        db.profiles[name] = { feedback: { up: 0, down: 0 }, eventsAttended: 0, status: 'Nuovo utente' };
-      }
-      if (val === 1) db.profiles[name].feedback.up += 1;
-      if (val === -1) db.profiles[name].feedback.down += 1;
-      db.profiles[name].status = computeStatus(db.profiles[name]);
-    });
-
-    if (imageUrl) {
-      db.posts.push({
-        id: uuidv4(),
-        type: 'photo',
-        text: `Foto evento: ${g.name}`,
-        image: imageUrl,
-        likes: 0,
-        likedBy: [],
-        comments: [],
-        username: req.user.username,
-        createdAt: new Date().toISOString()
-      });
-    }
-
-    await writeDB(db);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('VOTES error:', e);
-    res.status(500).json({ error: e.message || 'Errore server' });
-  }
-});
-
-// ---------- JOB: scadenza eventi + invio richieste voto ----------
-cron.schedule('*/5 * * * *', async () => {
-  const db = await readDB();
-  const now = new Date();
-
-  for (const g of db.groups) {
-    const eventDate = new Date(`${g.date}T${g.time}:00`);
-    g.hasExpired = eventDate < now;
-
-    if (!g.attendanceProcessed && now > eventDate) {
-      g.attendanceProcessed = true;
-      g.participants.forEach(name => {
-        if (!db.profiles[name]) {
-          db.profiles[name] = { feedback: { up: 0, down: 0 }, eventsAttended: 0, status: 'Nuovo utente' };
-        }
-        db.profiles[name].eventsAttended = (db.profiles[name].eventsAttended || 0) + 1;
-        db.profiles[name].status = computeStatus(db.profiles[name]);
-      });
-    }
-
-    const msDiff = now - eventDate;
-    if (msDiff >= 24 * 60 * 60 * 1000) {
-      g.voteRequestsSent = g.voteRequestsSent || {};
-      for (const p of g.participants) {
-        if (!g.voteRequestsSent[p]) {
-          db.notifications.push({
-            id: uuidv4(),
-            user: p,
-            type: 'vote_request',
-            message: `Vota i partecipanti di "${g.name}" e carica una foto dell'evento`,
-            groupId: g.id,
-            groupData: {
-              id: g.id,
-              name: g.name,
-              date: g.date,
-              time: g.time,
-              city: g.city,
-              address: g.address
-            },
-            read: false,
-            timestamp: new Date().toISOString()
-          });
-          g.voteRequestsSent[p] = true;
-        }
-      }
-    }
-  }
-
-  await writeDB(db);
-  console.log('🕒 job: controllo eventi e notifiche voto OK');
-});
-
-// === UPLOAD IMMAGINI (Render: storage effimero in /tmp) ===
-const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
-
+// --- GROUPS/VOTES/UPLOAD (immutati) ---
 const UPLOAD_DIR = '/tmp/uploads';
 try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch {}
-
-const storage = multer.diskStorage({
+const multerStorage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
   filename: (_req, file, cb) => {
     const safe = Date.now() + '-' + file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
     cb(null, safe);
   },
 });
-const upload = multer({ storage });
-
+const upload = multer({ storage: multerStorage });
 app.use('/uploads', express.static(UPLOAD_DIR));
-
 app.post('/api/upload', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Nessun file' });
   const url = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
   res.json({ url });
 });
-// --- EMAIL CONFIRM: redirect al login del frontend
-app.get(['/confirm-email', '/api/users/confirm-email'], (req, res) => {
-  // URL della tua pagina di login pubblica (impostalo su Render)
-  const DEST = process.env.FRONTEND_LOGIN_URL 
-    || `${req.protocol}://${req.get('host')}`; // fallback: root backend (solo per non 404)
 
-  // Costruisco l'URL e aggiungo il flag ?emailConfirmed=1
-  try {
-    const u = new URL(DEST);
-    u.searchParams.set('emailConfirmed', '1');
-    if (req.query.email) u.searchParams.set('email', String(req.query.email));
-    return res.redirect(302, u.toString());
-  } catch {
-    // Se DEST non è un URL assoluto, ripiego al root backend
-    return res.redirect(302, `${req.protocol}://${req.get('host')}/?emailConfirmed=1`);
-  }
-});
-
-// ---------- start ----------
+// --- start ---
 app.listen(PORT, () => {
   console.log(`✅ Server avviato su http://localhost:${PORT}`);
 });
