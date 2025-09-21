@@ -1,4 +1,4 @@
-// utils/mailer.js (CommonJS)
+// utils/mailer.js
 const nodemailer = require('nodemailer');
 
 const {
@@ -12,11 +12,8 @@ const {
 const transporter = nodemailer.createTransport({
   host: SMTP_HOST,
   port: Number(SMTP_PORT),
-  secure: Number(SMTP_PORT) === 465, // true su 465
-  auth: {
-    user: SMTP_USER,
-    pass: SMTP_PASS,
-  },
+  secure: Number(SMTP_PORT) === 465, // 465 = SSL
+  auth: { user: SMTP_USER, pass: SMTP_PASS },
 });
 
 async function sendMail({ to, subject, html, text }) {
@@ -29,4 +26,4 @@ async function sendMail({ to, subject, html, text }) {
   });
 }
 
-module.exports = { transporter, sendMail };
+module.exports = { sendMail };
