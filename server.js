@@ -8,6 +8,9 @@ const cron = require('node-cron');
 const { readDB, writeDB } = require('./db');
 const dbpg = require('./db_pg'); // client Postgres opzionale (health/info)
 
+// ✨ NEW: mailer per invio email
+const { sendMail } = require('./utils/mailer');
+
 // --- DEBUG ENV (puoi rimuovere quando vuoi) ---
 const rawConn = process.env.DATABASE_URL || '';
 const maskedConn = rawConn
@@ -100,9 +103,24 @@ app.get('/health/db-file', async (_req, res) => {
 });
 
 // ---------- AUTH ----------
+
+// ✨ NEW: controllo disponibilità username
+app.get('/api/users/check-username', async (req, res) => {
+  try {
+    const { username } = req.query || {};
+    if (!username) return res.status(400).json({ available: false, error: 'username mancante' });
+    const db = await readDB();
+    const exists = db.users.some(u => u.username.toLowerCase() === String(username).toLowerCase());
+    res.json({ available: !exists });
+  } catch (e) {
+    console.error('CHECK USERNAME error:', e);
+    res.status(500).json({ available: true, error: 'server' });
+  }
+});
+
 app.post('/api/users/register', async (req, res) => {
   try {
-    const { username, password } = req.body || {};
+    const { username, password, email } = req.body || {};
     if (!username || !password) return res.status(400).json({ error: 'username e password richiesti' });
 
     const db = await readDB();
@@ -115,6 +133,8 @@ app.post('/api/users/register', async (req, res) => {
       id: uuidv4(),
       username,
       passwordHash: hash,
+      // ✨ NEW: memorizziamo anche l'email se fornita
+      email: email || '',
       eta: '',
       citta: '',
       descrizione: '',
@@ -134,7 +154,16 @@ app.post('/api/users/register', async (req, res) => {
     await writeDB(db);
 
     const token = signToken({ id: user.id, username: user.username });
-    res.json({ token, user: { id: user.id, username: user.username, profilePhoto: user.profilePhoto, city: user.city } });
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email || '',
+        profilePhoto: user.profilePhoto,
+        city: user.city
+      }
+    });
   } catch (e) {
     console.error('REGISTER error:', e);
     res.status(500).json({ error: e.message || 'Errore server' });
@@ -159,6 +188,7 @@ app.post('/api/users/login', async (req, res) => {
       user: {
         id: user.id,
         username: user.username,
+        email: user.email || '',
         profilePhoto: user.profilePhoto,
         city: user.city,
         eta: user.eta || '',
@@ -185,10 +215,10 @@ app.get('/api/users/me', auth, async (req, res) => {
   }
 });
 
-// aggiorna dati profilo base (eta, citta, descrizione, profilePhoto url)
+// aggiorna dati profilo base (eta, citta, descrizione, profilePhoto url, city, email)
 app.put('/api/users/me', auth, async (req, res) => {
   try {
-    const { eta, citta, descrizione, profilePhoto, city } = req.body || {};
+    const { eta, citta, descrizione, profilePhoto, city, email } = req.body || {};
     const db = await readDB();
     const user = db.users.find(u => u.id === req.user.id);
     if (!user) return res.status(404).json({ error: 'Not found' });
@@ -197,11 +227,33 @@ app.put('/api/users/me', auth, async (req, res) => {
     if (descrizione !== undefined) user.descrizione = descrizione;
     if (profilePhoto !== undefined) user.profilePhoto = profilePhoto;
     if (city !== undefined) user.city = city;
+    // ✨ NEW: permettiamo di salvare/aggiornare l'email
+    if (email !== undefined) user.email = email;
     await writeDB(db);
     res.json({ ok: true, user });
   } catch (e) {
     console.error('UPDATE ME error:', e);
     res.status(500).json({ error: e.message || 'Errore server' });
+  }
+});
+
+// ✨ NEW: invio email di conferma
+app.post('/api/users/send-confirmation', async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ error: 'Email mancante' });
+
+    await sendMail({
+      to: email,
+      subject: 'Conferma la tua email - Grupy',
+      text: 'Ciao! Abbiamo registrato il tuo account su Grupy. Controlla la tua casella email.',
+      html: '<h2>Benvenuto in Grupy 🎉</h2><p>Abbiamo inviato una mail di conferma: controlla la tua casella di posta (anche spam).</p>',
+    });
+
+    res.json({ ok: true, sent: true });
+  } catch (err) {
+    console.error('send-confirmation error:', err);
+    res.status(500).json({ ok: false, error: 'Invio email fallito' });
   }
 });
 
@@ -353,7 +405,6 @@ app.post('/api/groups/:id/votes', auth, async (req, res) => {
 });
 
 // ---------- JOB: scadenza eventi + invio richieste voto ----------
-// Ogni 5 minuti controlla i gruppi scaduti -> dopo 24h invia notifica "vote_request" a chi non l'ha ancora ricevuta.
 cron.schedule('*/5 * * * *', async () => {
   const db = await readDB();
   const now = new Date();
