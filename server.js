@@ -8,17 +8,15 @@ const { v4: uuidv4 } = require('uuid');
 const multer = require('multer');
 const fs = require('fs');
 
-const { readDB, writeDB } = require('./db');
+const { pool, ensureSchema } = require('./db-pg');       // <-- Postgres
 const { sendMail } = require('./utils/mailer');
 
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || 'changeme';
 
-// CORS
 const rawCors = String(process.env.CORS_ORIGIN || '').trim();
 const ALLOWED_ORIGINS = rawCors ? rawCors.split(',').map(s => s.trim()).filter(Boolean) : [];
 
-// URL pubblici / bridge
 const BACKEND_PUBLIC_URL = (process.env.BACKEND_PUBLIC_URL || '').replace(/\/$/, '');
 const PUBLIC_APP_URL = (process.env.PUBLIC_APP_URL || '').replace(/\/$/, '');
 const FRONTEND_LOGIN_URL =
@@ -26,13 +24,6 @@ const FRONTEND_LOGIN_URL =
   (PUBLIC_APP_URL ? `${PUBLIC_APP_URL}/login` : '');
 const APP_SCHEME = (process.env.APP_SCHEME || 'grupy://login').replace(/\/$/, '');
 const ANDROID_PACKAGE = process.env.ANDROID_PACKAGE || '';
-
-function getSchemePrefix(s = APP_SCHEME) {
-  const i = s.indexOf('://');
-  if (i === -1) return 'grupy://';
-  return s.slice(0, i + 3);
-}
-const APP_SCHEME_PREFIX = getSchemePrefix(APP_SCHEME);
 
 const app = express();
 
@@ -60,6 +51,7 @@ app.use(cors({
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization'],
 }));
+
 app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -84,7 +76,6 @@ function auth(req, res, next) {
   catch { return res.status(401).json({ error: 'Invalid token' }); }
 }
 
-// deep link / device detection
 function detectPlatform(req) {
   const ua = String(req.headers['user-agent'] || '').toLowerCase();
   if (ua.includes('android')) return 'android';
@@ -100,24 +91,26 @@ function makeAndroidIntent(deepLink, fallbackUrl) {
     `#Intent;scheme=${scheme};package=${ANDROID_PACKAGE};S.browser_fallback_url=${encodedFallback};end`
   );
 }
-
-// ---------- bootstrap DB ----------
-async function ensureDbShape() {
-  const db = await readDB();
-  db.users = Array.isArray(db.users) ? db.users : [];
-  db.profiles = db.profiles && typeof db.profiles === 'object' ? db.profiles : {};
-  db.groups = Array.isArray(db.groups) ? db.groups : [];
-  db.notifications = Array.isArray(db.notifications) ? db.notifications : [];
-  await writeDB(db);
-  return db;
+function getSchemePrefix(s = APP_SCHEME) {
+  const i = s.indexOf('://');
+  return i === -1 ? 'grupy://' : s.slice(0, i + 3);
 }
+const APP_SCHEME_PREFIX = getSchemePrefix(APP_SCHEME);
+
+// ---------- Avvio: crea schema se manca ----------
+ensureSchema()
+  .then(() => console.log('🗄️  Postgres schema OK'))
+  .catch((e) => { console.error('Schema init error:', e); process.exit(1); });
 
 // ---------- base ----------
-app.get('/', (_req, res) => res.json({ ok: true, service: 'Grupy API' }));
-app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/', (_req, res) => res.json({ ok: true, service: 'Grupy API (pg)' }));
+app.get('/health', async (_req, res) => {
+  try { await pool.query('SELECT 1'); res.json({ ok: true }); }
+  catch { res.status(500).json({ ok: false }); }
+});
 app.get('/__version', (_req, res) =>
   res.json({
-    build: 'server-groups-v1',   // <— cambia qui quando redeployi
+    build: 'server-pg-v1',
     emailRoute: '/api/users/send-confirmation',
     resetRoute: '/reset-password',
     openApp: '/open-app',
@@ -130,30 +123,28 @@ app.get('/__version', (_req, res) =>
 // ---------- AUTH ----------
 app.post('/api/users/register', async (req, res) => {
   try {
-    await ensureDbShape();
     const { username, password, email } = req.body || {};
     if (!username || !password) return res.status(400).json({ error: 'username e password richiesti' });
 
-    const db = await readDB();
-    if (db.users.find(u => (u.username || '').toLowerCase() === String(username).toLowerCase())) {
-      return res.status(409).json({ error: 'Username già in uso' });
-    }
-    const user = {
-      id: uuidv4(),
-      username,
-      email: email || '',
-      emailVerified: false,
-      passwordHash: await bcrypt.hash(password, 10),
-      eta: '', citta: '', descrizione: '', profilePhoto: null, city: ''
-    };
-    db.users.push(user);
-    if (!db.profiles[username]) {
-      db.profiles[username] = { feedback: { up: 0, down: 0 }, eventsAttended: 0, status: 'Nuovo utente' };
-    }
-    await writeDB(db);
+    const exist = await pool.query('SELECT 1 FROM users WHERE LOWER(username)=LOWER($1)', [username]);
+    if (exist.rowCount > 0) return res.status(409).json({ error: 'Username già in uso' });
 
-    const token = signToken({ id: user.id, username: user.username });
-    res.json({ token, user: { id: user.id, username, email: user.email, profilePhoto: user.profilePhoto, city: user.city } });
+    const id = uuidv4();
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    await pool.query(`
+      INSERT INTO users (id, username, email, email_verified, password_hash, eta, citta, descrizione, profile_photo, city)
+      VALUES ($1,$2,$3,false,$4,'','','',NULL,'')
+    `, [id, username, email || '', passwordHash]);
+
+    await pool.query(`
+      INSERT INTO profiles (username, feedback_up, feedback_down, events_attended, status)
+      VALUES ($1,0,0,0,'Nuovo utente')
+      ON CONFLICT (username) DO NOTHING
+    `, [username]);
+
+    const token = signToken({ id, username });
+    res.json({ token, user: { id, username, email: email || '', profilePhoto: null, city: '' } });
   } catch (e) {
     console.error('REGISTER error:', e);
     res.status(500).json({ error: e.message || 'Errore server' });
@@ -162,24 +153,26 @@ app.post('/api/users/register', async (req, res) => {
 
 app.post('/api/users/login', async (req, res) => {
   try {
-    await ensureDbShape();
     const { username, password } = req.body || {};
     if (!username || !password) return res.status(400).json({ error: 'username e password richiesti' });
 
-    const db = await readDB();
-    const user = db.users.find(u => (u.username || '').toLowerCase() === String(username).toLowerCase());
-    if (!user) return res.status(401).json({ error: 'Credenziali non valide' });
+    const r = await pool.query(`
+      SELECT id, username, email, email_verified, password_hash, profile_photo, city, eta, citta, descrizione
+      FROM users WHERE LOWER(username)=LOWER($1)
+    `, [username]);
+    if (r.rowCount === 0) return res.status(401).json({ error: 'Credenziali non valide' });
 
-    const ok = await bcrypt.compare(password, user.passwordHash || '');
+    const u = r.rows[0];
+    const ok = await bcrypt.compare(password, u.password_hash || '');
     if (!ok) return res.status(401).json({ error: 'Credenziali non valide' });
 
-    const token = signToken({ id: user.id, username: user.username });
+    const token = signToken({ id: u.id, username: u.username });
     res.json({
       token,
       user: {
-        id: user.id, username: user.username, email: user.email,
-        emailVerified: !!user.emailVerified, profilePhoto: user.profilePhoto, city: user.city,
-        eta: user.eta || '', citta: user.citta || '', descrizione: user.descrizione || ''
+        id: u.id, username: u.username, email: u.email,
+        emailVerified: !!u.email_verified, profilePhoto: u.profile_photo, city: u.city,
+        eta: u.eta || '', citta: u.citta || '', descrizione: u.descrizione || ''
       }
     });
   } catch (e) {
@@ -190,12 +183,23 @@ app.post('/api/users/login', async (req, res) => {
 
 app.get('/api/users/me', auth, async (req, res) => {
   try {
-    await ensureDbShape();
-    const db = await readDB();
-    const user = db.users.find(u => u.id === req.user.id);
-    if (!user) return res.status(404).json({ error: 'Not found' });
-    const profile = db.profiles[user.username] || { feedback: { up: 0, down: 0 }, eventsAttended: 0, status: 'Nuovo utente' };
-    res.json({ user, profile });
+    const r = await pool.query(`
+      SELECT id, username, email, email_verified, profile_photo, city, eta, citta, descrizione
+      FROM users WHERE id=$1
+    `, [req.user.id]);
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Not found' });
+    const u = r.rows[0];
+
+    const p = await pool.query(`SELECT feedback_up, feedback_down, events_attended, status FROM profiles WHERE username=$1`, [u.username]);
+    const profile = p.rowCount
+      ? { feedback: { up: p.rows[0].feedback_up, down: p.rows[0].feedback_down }, eventsAttended: p.rows[0].events_attended, status: p.rows[0].status }
+      : { feedback: { up: 0, down: 0 }, eventsAttended: 0, status: 'Nuovo utente' };
+
+    res.json({ user: {
+      id: u.id, username: u.username, email: u.email, emailVerified: !!u.email_verified,
+      profilePhoto: u.profile_photo, city: u.city, eta: u.eta || '', citta: u.citta || '',
+      descrizione: u.descrizione || ''
+    }, profile });
   } catch (e) {
     res.status(500).json({ error: e.message || 'Errore server' });
   }
@@ -203,19 +207,23 @@ app.get('/api/users/me', auth, async (req, res) => {
 
 app.put('/api/users/me', auth, async (req, res) => {
   try {
-    await ensureDbShape();
     const { eta, citta, descrizione, profilePhoto, city, email } = req.body || {};
-    const db = await readDB();
-    const user = db.users.find(u => u.id === req.user.id);
-    if (!user) return res.status(404).json({ error: 'Not found' });
-    if (eta !== undefined) user.eta = eta;
-    if (citta !== undefined) user.citta = citta;
-    if (descrizione !== undefined) user.descrizione = descrizione;
-    if (profilePhoto !== undefined) user.profilePhoto = profilePhoto;
-    if (city !== undefined) user.city = city;
-    if (email !== undefined && isValidEmail(email)) user.email = email;
-    await writeDB(db);
-    res.json({ ok: true, user });
+    const r = await pool.query(`SELECT id, username FROM users WHERE id=$1`, [req.user.id]);
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Not found' });
+
+    await pool.query(`
+      UPDATE users SET
+        eta = COALESCE($2, eta),
+        citta = COALESCE($3, citta),
+        descrizione = COALESCE($4, descrizione),
+        profile_photo = COALESCE($5, profile_photo),
+        city = COALESCE($6, city),
+        email = CASE WHEN $7 IS NOT NULL THEN $7 ELSE email END
+      WHERE id=$1
+    `, [req.user.id, eta ?? null, citta ?? null, descrizione ?? null, profilePhoto ?? null, city ?? null, (email && isValidEmail(email)) ? email : null]);
+
+    const r2 = await pool.query(`SELECT id, username, email, email_verified, profile_photo, city, eta, citta, descrizione FROM users WHERE id=$1`, [req.user.id]);
+    res.json({ ok: true, user: r2.rows[0] });
   } catch (e) {
     res.status(500).json({ error: e.message || 'Errore server' });
   }
@@ -223,12 +231,10 @@ app.put('/api/users/me', auth, async (req, res) => {
 
 app.get('/api/users/check-username', async (req, res) => {
   try {
-    await ensureDbShape();
     const username = String(req.query?.username || '').trim();
     if (!username) return res.json({ available: false });
-    const db = await readDB();
-    const exists = db.users.some(u => (u.username || '').toLowerCase() === username.toLowerCase());
-    res.json({ available: !exists });
+    const r = await pool.query(`SELECT 1 FROM users WHERE LOWER(username)=LOWER($1)`, [username]);
+    res.json({ available: r.rowCount === 0 });
   } catch {
     res.json({ available: true });
   }
@@ -237,10 +243,12 @@ app.get('/api/users/check-username', async (req, res) => {
 // ---------- Email confirm ----------
 app.post('/api/users/send-confirmation', async (req, res) => {
   try {
-    await ensureDbShape();
     const candidates = [
-      req.body?.email, req.body?.address, req.headers['x-test-email'],
-      req.query?.email, typeof req.body === 'string' ? req.body : '',
+      req.body?.email,
+      req.body?.address,
+      req.headers['x-test-email'],
+      req.query?.email,
+      typeof req.body === 'string' ? req.body : '',
     ].filter(Boolean);
 
     const email = extractEmail(candidates.find(v => isValidEmail(v)) || '');
@@ -291,7 +299,8 @@ app.get('/open-app', (req, res) => {
 const confirmEmailHandler = async (req, res) => {
   const webBase =
     (FRONTEND_LOGIN_URL || (PUBLIC_APP_URL ? `${PUBLIC_APP_URL}/login` : '')).replace(/\/$/, '');
-  const webLoginUrl = webBase && /^https?:\/\//.test(webBase) ? `${webBase}` : `${getBackendBase(req)}/`;
+  const webLoginUrl = webBase && /^https?:\/\//.test(webBase)
+    ? `${webBase}` : `${getBackendBase(req)}/`;
 
   const mkWebWith = (qs) => {
     const url = new URL(webLoginUrl);
@@ -314,11 +323,8 @@ const confirmEmailHandler = async (req, res) => {
       return res.redirect(302, mkWebWith({ emailConfirmed: 0, reason: 'expired' }));
     }
 
-    const db = await readDB();
-    const user = db.users.find(u => (u.email || '').toLowerCase() === String(email).toLowerCase());
-    if (!user) return res.redirect(302, mkWebWith({ emailConfirmed: 0, reason: 'not_found' }));
-    user.emailVerified = true;
-    await writeDB(db);
+    const r = await pool.query(`UPDATE users SET email_verified=true WHERE LOWER(email)=LOWER($1) RETURNING username`, [email]);
+    if (r.rowCount === 0) return res.redirect(302, mkWebWith({ emailConfirmed: 0, reason: 'not_found' }));
 
     const platform = detectPlatform(req);
     const deepLink = `${APP_SCHEME}?emailConfirmed=1`;
@@ -342,7 +348,6 @@ app.get(['/api/users/confirm-email', '/confirm-email'], confirmEmailHandler);
 // ---------- Password reset ----------
 app.post('/api/users/password/request', async (req, res) => {
   try {
-    await ensureDbShape();
     const email = extractEmail(req.body?.email || '');
     if (!isValidEmail(email)) return res.status(400).json({ error: 'Email non valida' });
 
@@ -371,7 +376,6 @@ app.post('/api/users/password/request', async (req, res) => {
 
 app.post('/api/users/password/reset', async (req, res) => {
   try {
-    await ensureDbShape();
     const { token, newPassword } = req.body || {};
     if (!token || !newPassword || String(newPassword).length < 6) {
       return res.status(400).json({ error: 'Token o password non validi' });
@@ -385,12 +389,10 @@ app.post('/api/users/password/reset', async (req, res) => {
       return res.status(400).json({ error: 'Token scaduto o non valido' });
     }
 
-    const db = await readDB();
-    const user = db.users.find(u => (u.email || '').toLowerCase() === String(email).toLowerCase());
-    if (!user) return res.status(404).json({ error: 'Utente non trovato' });
+    const passwordHash = await bcrypt.hash(String(newPassword), 10);
+    const r = await pool.query(`UPDATE users SET password_hash=$2 WHERE LOWER(email)=LOWER($1) RETURNING id`, [email, passwordHash]);
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Utente non trovato' });
 
-    user.passwordHash = await bcrypt.hash(String(newPassword), 10);
-    await writeDB(db);
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message || 'Errore server' });
@@ -430,137 +432,162 @@ function computeHasExpired(g) {
   if (Number.isNaN(ts)) return false;
   return Date.now() > ts;
 }
-function pickGroupForClient(g) {
+function pickGroupForClient(row, participants) {
   return {
-    id: g.id, creator: g.creator, createdAt: g.createdAt,
-    name: g.name, category: g.category, date: g.date, time: g.time,
-    city: g.city, address: g.address, description: g.description,
-    budget: g.budget, maxParticipants: g.maxParticipants,
-    coverPhoto: g.coverPhoto || null, participants: g.participants || [],
-    location: g.location || null, hasExpired: computeHasExpired(g),
-    attendanceProcessed: !!g.attendanceProcessed, voteRequestsSent: g.voteRequestsSent || {},
+    id: row.id,
+    creator: row.creator,
+    createdAt: row.created_at,
+    name: row.name,
+    category: row.category,
+    date: row.date,
+    time: row.time,
+    city: row.city,
+    address: row.address,
+    description: row.description,
+    budget: Number(row.budget || 0),
+    maxParticipants: row.max_participants,
+    coverPhoto: row.cover_photo || null,
+    participants: participants || [],
+    location: (row.location_lat != null && row.location_lng != null)
+      ? { lat: Number(row.location_lat), lng: Number(row.location_lng) }
+      : null,
+    hasExpired: computeHasExpired(row),
+    attendanceProcessed: !!row.attendance_processed,
+    voteRequestsSent: {}, // non usato lato pg, placeholder
   };
 }
 
-app.get('/api/groups', auth, async (req, res) => {
+app.get('/api/groups', auth, async (_req, res) => {
   try {
-    await ensureDbShape();
-    const db = await readDB();
-    const list = (db.groups || [])
-      .map(pickGroupForClient)
-      .sort((a,b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0));
-    res.json(list);
+    const r = await pool.query(`SELECT * FROM groups ORDER BY created_at DESC`);
+    const rows = r.rows;
+
+    // carica partecipanti in blocco
+    const ids = rows.map(x => x.id);
+    let partMap = {};
+    if (ids.length) {
+      const pr = await pool.query(`
+        SELECT group_id, username FROM group_participants WHERE group_id = ANY($1::text[])
+      `, [ids]);
+      pr.rows.forEach(p => {
+        if (!partMap[p.group_id]) partMap[p.group_id] = [];
+        partMap[p.group_id].push(p.username);
+      });
+    }
+
+    const out = rows.map(g => pickGroupForClient(g, partMap[g.id] || []));
+    res.json(out);
   } catch (e) {
+    console.error('GET /api/groups', e);
     res.status(500).json({ error: e.message || 'Errore server' });
   }
 });
 
 app.post('/api/groups', auth, async (req, res) => {
   try {
-    await ensureDbShape();
     const {
       name, category, date, time, city, address, description,
       budget = 0, maxParticipants = 10, coverPhoto = null, location = null,
     } = req.body || {};
-
     if (!name || !category || !date || !time || !city || !address || !description) {
       return res.status(400).json({ error: 'Campi richiesti mancanti' });
     }
 
-    const db = await readDB();
-    const g = {
-      id: Date.now().toString(),
-      creator: req.user.username,
-      createdAt: new Date().toISOString(),
-      name, category, date, time, city, address, description,
-      budget: Number(budget) || 0,
-      maxParticipants: Number(maxParticipants) || 10,
-      coverPhoto,
-      participants: [req.user.username],
-      location,
-      attendanceProcessed: false,
-      voteRequestsSent: {},
-    };
-    db.groups.unshift(g);
+    const id = Date.now().toString();
+    await pool.query(`
+      INSERT INTO groups
+      (id, creator, created_at, name, category, date, time, city, address, description,
+       budget, max_participants, cover_photo, location_lat, location_lng, attendance_processed)
+      VALUES
+      ($1,$2,now(),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,false)
+    `, [
+      id, req.user.username, name, category, date, time, city, address, description,
+      Number(budget) || 0, Number(maxParticipants) || 10, coverPhoto,
+      location?.lat ?? null, location?.lng ?? null
+    ]);
 
-    db.notifications.unshift({
-      id: uuidv4(),
-      user: req.user.username,
-      type: 'info',
-      message: `Hai creato il gruppo "${name}"`,
-      groupId: g.id,
-      timestamp: new Date().toISOString(),
-      read: false,
-    });
+    await pool.query(`
+      INSERT INTO group_participants (group_id, username) VALUES ($1,$2)
+      ON CONFLICT DO NOTHING
+    `, [id, req.user.username]);
 
-    await writeDB(db);
-    res.status(201).json(pickGroupForClient(g));
+    await pool.query(`
+      INSERT INTO notifications (id, user_to, type, message, group_id, timestamp, read)
+      VALUES ($1,$2,'info',$3,$4, now(), false)
+    `, [uuidv4(), req.user.username, `Hai creato il gruppo "${name}"`, id]);
+
+    const row = (await pool.query(`SELECT * FROM groups WHERE id=$1`, [id])).rows[0];
+    const out = pickGroupForClient(row, [req.user.username]);
+    res.status(201).json(out);
   } catch (e) {
+    console.error('POST /api/groups', e);
     res.status(500).json({ error: e.message || 'Errore server' });
   }
 });
 
 app.post('/api/groups/:id/join', auth, async (req, res) => {
   try {
-    await ensureDbShape();
-    const db = await readDB();
-    const g = db.groups.find(x => x.id === req.params.id);
-    if (!g) return res.status(404).json({ error: 'Group not found' });
-    if (!Array.isArray(g.participants)) g.participants = [];
-    if (!g.participants.includes(req.user.username)) {
-      if (g.participants.length >= (g.maxParticipants || 10)) {
-        return res.status(400).json({ error: 'Gruppo completo' });
-      }
-      g.participants.push(req.user.username);
+    const id = req.params.id;
+    const gr = await pool.query(`SELECT * FROM groups WHERE id=$1`, [id]);
+    if (gr.rowCount === 0) return res.status(404).json({ error: 'Group not found' });
+    const g = gr.rows[0];
+
+    const pr = await pool.query(`SELECT COUNT(*)::int AS c FROM group_participants WHERE group_id=$1`, [id]);
+    const count = pr.rows[0].c || 0;
+    if (count >= (g.max_participants || 10)) {
+      return res.status(400).json({ error: 'Gruppo completo' });
     }
+
+    await pool.query(`
+      INSERT INTO group_participants (group_id, username) VALUES ($1,$2)
+      ON CONFLICT DO NOTHING
+    `, [id, req.user.username]);
 
     if (req.user.username !== g.creator) {
-      db.notifications.unshift({
-        id: uuidv4(),
-        user: g.creator,
-        type: 'info',
-        message: `${req.user.username} si è unito al tuo gruppo "${g.name}"`,
-        groupId: g.id,
-        timestamp: new Date().toISOString(),
-        read: false,
-      });
+      await pool.query(`
+        INSERT INTO notifications (id, user_to, type, message, group_id, timestamp, read)
+        VALUES ($1,$2,'info',$3,$4, now(), false)
+      `, [uuidv4(), g.creator, `${req.user.username} si è unito al tuo gruppo "${g.name}"`, g.id]);
     }
 
-    await writeDB(db);
-    res.json({ ok: true, group: pickGroupForClient(g) });
+    const participants = (await pool.query(`SELECT username FROM group_participants WHERE group_id=$1`, [id])).rows.map(r => r.username);
+    res.json({ ok: true, group: pickGroupForClient(g, participants) });
   } catch (e) {
+    console.error('JOIN group', e);
     res.status(500).json({ error: e.message || 'Errore server' });
   }
 });
 
 app.post('/api/groups/:id/leave', auth, async (req, res) => {
   try {
-    await ensureDbShape();
-    const db = await readDB();
-    const g = db.groups.find(x => x.id === req.params.id);
-    if (!g) return res.status(404).json({ error: 'Group not found' });
+    const id = req.params.id;
+    const gr = await pool.query(`SELECT * FROM groups WHERE id=$1`, [id]);
+    if (gr.rowCount === 0) return res.status(404).json({ error: 'Group not found' });
+    const g = gr.rows[0];
 
     if (g.creator === req.user.username) {
       return res.status(400).json({ error: 'Il creatore non può lasciare il proprio gruppo' });
     }
-    g.participants = (g.participants || []).filter(u => u !== req.user.username);
 
-    await writeDB(db);
-    res.json({ ok: true, group: pickGroupForClient(g) });
+    await pool.query(`DELETE FROM group_participants WHERE group_id=$1 AND username=$2`, [id, req.user.username]);
+    const participants = (await pool.query(`SELECT username FROM group_participants WHERE group_id=$1`, [id])).rows.map(r => r.username);
+    res.json({ ok: true, group: pickGroupForClient(g, participants) });
   } catch (e) {
+    console.error('LEAVE group', e);
     res.status(500).json({ error: e.message || 'Errore server' });
   }
 });
 
 app.post('/api/groups/:id/remove-participant', auth, async (req, res) => {
   try {
-    await ensureDbShape();
+    const id = req.params.id;
     const { username } = req.body || {};
     if (!username) return res.status(400).json({ error: 'username richiesto' });
 
-    const db = await readDB();
-    const g = db.groups.find(x => x.id === req.params.id);
-    if (!g) return res.status(404).json({ error: 'Group not found' });
+    const gr = await pool.query(`SELECT * FROM groups WHERE id=$1`, [id]);
+    if (gr.rowCount === 0) return res.status(404).json({ error: 'Group not found' });
+    const g = gr.rows[0];
+
     if (g.creator !== req.user.username) {
       return res.status(403).json({ error: 'Solo il creatore può rimuovere partecipanti' });
     }
@@ -568,51 +595,47 @@ app.post('/api/groups/:id/remove-participant', auth, async (req, res) => {
       return res.status(400).json({ error: 'Non puoi rimuovere il creatore' });
     }
 
-    const down = db.profiles?.[username]?.feedback?.down || 0;
-    if (down <= 0) {
-      return res.status(400).json({ error: 'Il partecipante non ha feedback negativo' });
-    }
+    const pr = await pool.query(`SELECT feedback_down FROM profiles WHERE username=$1`, [username]);
+    const down = pr.rowCount ? (pr.rows[0].feedback_down || 0) : 0;
+    if (down <= 0) return res.status(400).json({ error: 'Il partecipante non ha feedback negativo' });
 
-    g.participants = (g.participants || []).filter(u => u !== username);
-    db.notifications.unshift({
-      id: uuidv4(),
-      user: username,
-      type: 'info',
-      message: `Sei stato rimosso dal gruppo "${g.name}"`,
-      groupId: g.id,
-      timestamp: new Date().toISOString(),
-      read: false,
-    });
+    await pool.query(`DELETE FROM group_participants WHERE group_id=$1 AND username=$2`, [id, username]);
+    await pool.query(`
+      INSERT INTO notifications (id, user_to, type, message, group_id, timestamp, read)
+      VALUES ($1,$2,'info',$3,$4, now(), false)
+    `, [uuidv4(), username, `Sei stato rimosso dal gruppo "${g.name}"`, id]);
 
-    await writeDB(db);
-    res.json({ ok: true, group: pickGroupForClient(g) });
+    const participants = (await pool.query(`SELECT username FROM group_participants WHERE group_id=$1`, [id])).rows.map(r => r.username);
+    res.json({ ok: true, group: pickGroupForClient(g, participants) });
   } catch (e) {
+    console.error('REMOVE participant', e);
     res.status(500).json({ error: e.message || 'Errore server' });
   }
 });
 
 app.post('/api/groups/:id/votes', auth, async (req, res) => {
   try {
-    await ensureDbShape();
     const { votes = {} } = req.body || {};
-    const db = await readDB();
-    const g = db.groups.find(x => x.id === req.params.id);
-    if (!g) return res.status(404).json({ error: 'Group not found' });
-
-    Object.entries(votes).forEach(([target, val]) => {
-      if (!target || target === req.user.username) return;
+    for (const [target, val] of Object.entries(votes)) {
+      if (!target || target === req.user.username) continue;
       const v = Number(val);
-      if (v !== 1 && v !== -1) return;
-      if (!db.profiles[target]) {
-        db.profiles[target] = { feedback: { up: 0, down: 0 }, eventsAttended: 0, status: 'Nuovo utente' };
-      }
-      if (v === 1) db.profiles[target].feedback.up = (db.profiles[target].feedback.up || 0) + 1;
-      if (v === -1) db.profiles[target].feedback.down = (db.profiles[target].feedback.down || 0) + 1;
-    });
+      if (v !== 1 && v !== -1) continue;
 
-    await writeDB(db);
+      await pool.query(`
+        INSERT INTO profiles (username, feedback_up, feedback_down, events_attended, status)
+        VALUES ($1,0,0,0,'Nuovo utente')
+        ON CONFLICT (username) DO NOTHING
+      `, [target]);
+
+      if (v === 1) {
+        await pool.query(`UPDATE profiles SET feedback_up = feedback_up + 1 WHERE username=$1`, [target]);
+      } else {
+        await pool.query(`UPDATE profiles SET feedback_down = feedback_down + 1 WHERE username=$1`, [target]);
+      }
+    }
     res.json({ ok: true });
   } catch (e) {
+    console.error('VOTES', e);
     res.status(500).json({ error: e.message || 'Errore server' });
   }
 });
@@ -620,11 +643,11 @@ app.post('/api/groups/:id/votes', auth, async (req, res) => {
 // ---------- NOTIFICATIONS ----------
 app.get('/api/notifications', auth, async (req, res) => {
   try {
-    await ensureDbShape();
-    const db = await readDB();
-    const mine = (db.notifications || []).filter(n => n.user === req.user.username)
-      .sort((a,b) => Date.parse(b.timestamp || 0) - Date.parse(a.timestamp || 0));
-    res.json(mine);
+    const r = await pool.query(`
+      SELECT id, user_to AS "user", type, message, group_id AS "groupId", timestamp, read
+      FROM notifications WHERE user_to=$1 ORDER BY timestamp DESC
+    `, [req.user.username]);
+    res.json(r.rows);
   } catch (e) {
     res.status(500).json({ error: e.message || 'Errore server' });
   }
@@ -632,16 +655,12 @@ app.get('/api/notifications', auth, async (req, res) => {
 
 app.post('/api/notifications/mark-read', auth, async (req, res) => {
   try {
-    await ensureDbShape();
     const { id, all } = req.body || {};
-    const db = await readDB();
-    db.notifications = (db.notifications || []).map(n => {
-      if (n.user !== req.user.username) return n;
-      if (all) return { ...n, read: true };
-      if (id && n.id === id) return { ...n, read: true };
-      return n;
-    });
-    await writeDB(db);
+    if (all) {
+      await pool.query(`UPDATE notifications SET read=true WHERE user_to=$1`, [req.user.username]);
+    } else if (id) {
+      await pool.query(`UPDATE notifications SET read=true WHERE user_to=$1 AND id=$2`, [req.user.username, id]);
+    }
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message || 'Errore server' });
