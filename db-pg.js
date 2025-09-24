@@ -1,12 +1,11 @@
-// server/db-pg.js — client Postgres con forzatura IPv4 + auto-schema
+// db-pg.js — client Postgres con forzatura IPv4 + auto-schema
 const { Pool } = require('pg');
 
 const connectionString = process.env.DATABASE_URL;
-const hostOverride = process.env.DATABASE_HOST4 || ''; // es. "34.***.***.***" per forzare IPv4
+const hostOverride = process.env.DATABASE_HOST4 || ''; // es. "34.xxx.xxx.xxx" per forzare IPv4
 
-// Parse minimale dell'URL (senza librerie extra)
+// Parse minimale dell'URL (postgresql://user:pass@host:port/db?sslmode=require)
 function parsePgUrl(url) {
-  // es: postgresql://user:pass@host:port/db?sslmode=require
   const m = url.match(/^postgres(?:ql)?:\/\/([^:]+):([^@]+)@([^:/?]+):?(\d+)?\/([^?]+)(?:\?(.+))?$/i);
   if (!m) throw new Error('DATABASE_URL non valido');
   const [, user, password, host, port, database, query] = m;
@@ -17,27 +16,19 @@ function parsePgUrl(url) {
       ? { rejectUnauthorized: false }
       : false;
 
-  return {
-    user,
-    password,
-    host,
-    port: port ? Number(port) : 5432,
-    database,
-    ssl,
-  };
+  return { user, password, host, port: port ? Number(port) : 5432, database, ssl };
 }
 
 function buildPoolConfig() {
   if (!connectionString) throw new Error('DATABASE_URL non impostata');
   const base = parsePgUrl(connectionString);
 
-  // Se c’è un IPv4 forzato in env, usiamolo al posto del nome host
   if (hostOverride) {
     console.log('🌐 Using DATABASE_HOST4 override:', hostOverride);
     return {
       user: base.user,
       password: base.password,
-      host: hostOverride, // <-- Forza IPv4
+      host: hostOverride, // forza IPv4
       port: base.port,
       database: base.database,
       ssl: base.ssl,
@@ -47,7 +38,6 @@ function buildPoolConfig() {
     };
   }
 
-  // Config standard
   return {
     user: base.user,
     password: base.password,
@@ -77,7 +67,7 @@ async function ping() {
   return res.rows?.[0]?.ok === 1;
 }
 
-// Crea tabelle e indici se non esistono (idempotente)
+// Crea tabelle/indici se non esistono (idempotente)
 async function ensureSchema() {
   await query(`
     CREATE TABLE IF NOT EXISTS users (
