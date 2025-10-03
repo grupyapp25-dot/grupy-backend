@@ -453,12 +453,50 @@ function pickGroupForClient(row, participants) {
       : null,
     hasExpired: computeHasExpired(row),
     attendanceProcessed: !!row.attendance_processed,
-    voteRequestsSent: {}, // non usato lato pg, placeholder
+    voteRequestsSent: {},
   };
+}
+
+/**
+ * Sweep che invia notifiche di voto per i gruppi scaduti e non ancora processati.
+ * - crea notifica 'vote_request' per ogni partecipante
+ * - marca attendance_processed=true sul gruppo
+ */
+async function sweepVoteRequestsIfNeeded() {
+  const gr = await pool.query(`SELECT * FROM groups WHERE attendance_processed=false`);
+  if (gr.rowCount === 0) return;
+
+  const candidates = gr.rows.filter(row => computeHasExpired(row));
+  if (candidates.length === 0) return;
+
+  for (const g of candidates) {
+    // partecipanti del gruppo
+    const pr = await pool.query(
+      `SELECT username FROM group_participants WHERE group_id=$1`,
+      [g.id]
+    );
+    const participants = pr.rows.map(r => r.username);
+
+    // invia notifica a TUTTI i partecipanti
+    const now = new Date();
+    for (const u of participants) {
+      await pool.query(`
+        INSERT INTO notifications (id, user_to, type, message, group_id, timestamp, read)
+        VALUES ($1,$2,'vote_request',$3,$4,$5,false)
+      `, [uuidv4(), u, `Dai un feedback ai partecipanti del gruppo "${g.name}"`, g.id, now]);
+    }
+
+    // marca processato
+    await pool.query(`UPDATE groups SET attendance_processed=true WHERE id=$1`, [g.id]);
+  }
 }
 
 app.get('/api/groups', auth, async (_req, res) => {
   try {
+    // 1) Sweep prima di rispondere
+    await sweepVoteRequestsIfNeeded();
+
+    // 2) Risposta gruppi
     const r = await pool.query(`SELECT * FROM groups ORDER BY created_at DESC`);
     const rows = r.rows;
 
@@ -640,6 +678,35 @@ app.post('/api/groups/:id/votes', auth, async (req, res) => {
   }
 });
 
+/**
+ * NUOVO: notifica chat agli altri partecipanti
+ * body: { preview?: string }
+ */
+app.post('/api/groups/:id/chat-notify', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { preview = '' } = req.body || {};
+    const gr = await pool.query(`SELECT * FROM groups WHERE id=$1`, [id]);
+    if (gr.rowCount === 0) return res.status(404).json({ error: 'Group not found' });
+    const g = gr.rows[0];
+
+    const pr = await pool.query(`SELECT username FROM group_participants WHERE group_id=$1`, [id]);
+    const others = pr.rows.map(r => r.username).filter(u => u !== req.user.username);
+
+    const now = new Date();
+    for (const u of others) {
+      await pool.query(`
+        INSERT INTO notifications (id, user_to, type, message, group_id, timestamp, read)
+        VALUES ($1,$2,'info',$3,$4,$5,false)
+      `, [uuidv4(), u, `${req.user.username}: ${preview || 'Nuovo messaggio'} in "${g.name}"`, g.id, now]);
+    }
+    res.json({ ok: true, notified: others.length });
+  } catch (e) {
+    console.error('chat-notify', e);
+    res.status(500).json({ error: e.message || 'Errore server' });
+  }
+});
+
 // ---------- NOTIFICATIONS ----------
 app.get('/api/notifications', auth, async (req, res) => {
   try {
@@ -647,8 +714,39 @@ app.get('/api/notifications', auth, async (req, res) => {
       SELECT id, user_to AS "user", type, message, group_id AS "groupId", timestamp, read
       FROM notifications WHERE user_to=$1 ORDER BY timestamp DESC
     `, [req.user.username]);
-    res.json(r.rows);
+
+    const rows = r.rows;
+
+    // arricchisci con participants[] e groupData per notifiche legate a gruppi
+    const groupIds = [...new Set(rows.map(x => x.groupId).filter(Boolean))];
+    let groupsMap = {};
+    let partMap = {};
+
+    if (groupIds.length) {
+      const gr = await pool.query(`SELECT * FROM groups WHERE id = ANY($1::text[])`, [groupIds]);
+      gr.rows.forEach(g => { groupsMap[g.id] = g; });
+
+      const pr = await pool.query(`SELECT group_id, username FROM group_participants WHERE group_id = ANY($1::text[])`, [groupIds]);
+      pr.rows.forEach(p => {
+        if (!partMap[p.group_id]) partMap[p.group_id] = [];
+        partMap[p.group_id].push(p.username);
+      });
+    }
+
+    const enriched = rows.map(n => {
+      if (!n.groupId || !groupsMap[n.groupId]) return n;
+      const g = groupsMap[n.groupId];
+      const participants = partMap[n.groupId] || [];
+      return {
+        ...n,
+        participants,
+        groupData: pickGroupForClient(g, participants), // struttura già compatibile col client
+      };
+    });
+
+    res.json(enriched);
   } catch (e) {
+    console.error('/api/notifications', e);
     res.status(500).json({ error: e.message || 'Errore server' });
   }
 });
