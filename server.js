@@ -71,9 +71,9 @@ function signToken(payload) {
 function auth(req, res, next) {
   const h = req.headers.authorization || '';
   const token = h.startsWith('Bearer ') ? h.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Missing token' });
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
   try { req.user = jwt.verify(token, JWT_SECRET); next(); }
-  catch { return res.status(401).json({ error: 'Invalid token' }); }
+  catch { return res.status(401).json({ error: 'Unauthorized' }); }
 }
 
 function detectPlatform(req) {
@@ -775,9 +775,12 @@ const multerStorage = multer.diskStorage({
     cb(null, safe);
   },
 });
-const upload = multer({ storage: multerStorage });
+const upload = multer({
+  storage: multerStorage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+});
 app.use('/uploads', express.static(UPLOAD_DIR));
-app.post('/api/upload', upload.single('file'), (req, res) => {
+app.post('/api/upload', auth, upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Nessun file' });
   const url = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
   res.json({ url });
